@@ -5,9 +5,24 @@ if [ $# != 0 ]; then
     echo "Usage: $0"
     exit 1;
 fi
+unames="$(uname -s)"
+if [[ ! ${unames} =~ Linux && ! ${unames} =~ Darwin ]]; then
+    echo "Warning: This script may not work with ${unames}. Exit with doing nothing"
+    exit 0
+fi
+
+# NOTE: espnet only uses the espeak backend of phonemizer
+# (see the espeak_ng_* g2p types in espnet2/text/phoneme_tokenizer.py).
+# The festival and MBROLA backends are not referenced anywhere in espnet,
+# and building speech_tools + festival takes ~4.5 min, which dominates the
+# install time of this script. They are therefore opt-in.
+: "${PHONEMIZER_WITH_FESTIVAL:=false}"
+: "${PHONEMIZER_WITH_MBROLA:=false}"
 
 # Install festival
-if [ ! -e festival.done ]; then
+if ! "${PHONEMIZER_WITH_FESTIVAL}"; then
+    echo "Skip installing festival (set PHONEMIZER_WITH_FESTIVAL=true to install it)"
+elif [ ! -e festival.done ]; then
     rm -rf speech_tools
     # NOTE(kan-bayashi): It is better to use fixed tag
     git clone --depth 5 https://github.com/festvox/speech_tools.git
@@ -36,8 +51,14 @@ if [ ! -e espeak-ng.done ]; then
     git clone https://github.com/espeak-ng/espeak-ng.git
     (
         set -euo pipefail
-        cd espeak-ng && ./autogen.sh && ./configure --prefix=$PWD && make && make install
-
+        cd espeak-ng
+        git checkout $(git tag --sort=-creatordate | head -n 1)
+        cmake -B build \
+            -DCMAKE_INSTALL_PREFIX="$PWD" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+        cmake --build build
+        cmake --install build
     )
     touch espeak-ng.done
 else
@@ -45,7 +66,9 @@ else
 fi
 
 # Install MBROLA
-if [ ! -e MBROLA.done ]; then
+if ! "${PHONEMIZER_WITH_MBROLA}"; then
+    echo "Skip installing MBROLA (set PHONEMIZER_WITH_MBROLA=true to install it)"
+elif [ ! -e MBROLA.done ]; then
     rm -rf MBROLA
     # NOTE(kan-bayashi): It is better to use fixed tag
     git clone https://github.com/numediart/MBROLA.git
@@ -60,12 +83,9 @@ fi
 
 # Install phonemizer
 if [ ! -e phonemizer.done ]; then
-    rm -rf phonemizer
-    # NOTE(kan-bayashi): It is better to use fixed tag
-    git clone https://github.com/bootphon/phonemizer
     (
         set -euo pipefail
-        cd phonemizer && python3 -m pip install -e .
+        pip install phonemizer==3.0
     )
     touch phonemizer.done
 else

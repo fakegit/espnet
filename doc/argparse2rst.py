@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 import importlib.machinery as imm
 import logging
+import os
 import pathlib
 import re
+import subprocess
 
 import configargparse
+
+
+def get_git_revision_hash() -> str:
+    return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("ascii").strip()
 
 
 class ModuleInfo:
@@ -20,49 +26,88 @@ class ModuleInfo:
 
 def get_parser():
     parser = configargparse.ArgumentParser(
-        description='generate RST from argparse options',
+        description="generate RST from argparse options",
         config_file_parser_class=configargparse.YAMLConfigFileParser,
-        formatter_class=configargparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('src', type=str, nargs='+',
-                        help='source python files that contain get_parser() func')
+        formatter_class=configargparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--title",
+        type=str,
+        default="Module Reference",
+        help="title for the generated RST",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=".",
+        help="output directory to save generated RSTs",
+    )
+    parser.add_argument(
+        "src",
+        type=str,
+        nargs="+",
+        help="source python files that contain get_parser() func",
+    )
     return parser
 
 
-# parser
-args = get_parser().parse_args()
+if __name__ == "__main__":
+    # parser
+    args = get_parser().parse_args()
 
+    modinfo = []
+    for p in args.src:
+        if "__init__.py" in p:
+            continue
+        try:
+            modinfo.append(ModuleInfo(p))
+        except Exception as e:
+            logging.error(f"Error processing {p}: {str(e)}")
 
-modinfo = []
+    print(
+        f"""
+{args.title}
+{"=" * len(args.title)}
 
-for p in args.src:
-    if "__init__.py" in p:
-        continue
-    modinfo.append(ModuleInfo(p))
+"""
+    )
 
+    for m in modinfo:
+        logging.info(f"processing: {m.path.name}")
+        d = m.module.get_parser().description
+        assert d is not None
+        print(f"- :ref:`{m.path.name}`: {d}")
 
-# print refs
-for m in modinfo:
-    logging.info(f"processing: {m.path.name}")
-    d = m.module.get_parser().description
-    assert d is not None
-    print(f"- :ref:`{m.path.name}`: {d}")
+    print()
 
-print()
+    os.makedirs(args.output_dir, exist_ok=True)
 
-# print argparse
-for m in modinfo:
-    cmd = m.path.name
-    sep = "~" * len(cmd)
-    print(f"""
-
-.. _{cmd}:
-
+    # print argparse to each files
+    for m in modinfo:
+        cmd = m.path.name
+        sourceurl = (
+            "https://github.com/espnet/espnet/blob/"
+            + get_git_revision_hash()
+            + "/"
+            + str(m.path.parent / m.path.stem)
+            + ".py"
+        )
+        sep = "~" * len(cmd)
+        mname = (
+            m.name if m.name.startswith("espnet") else ".".join(m.name.split(".")[1:])
+        )
+        with open(f"{args.output_dir}/{cmd[:-3]}.rst", "w") as writer:  # remove .py
+            writer.write(
+                f""".. _{cmd}
 {cmd}
 {sep}
 
+`source <{sourceurl}>`_
+
 .. argparse::
-   :module: {m.name}
+   :module: {mname}
    :func: get_parser
    :prog: {cmd}
 
-""")
+"""
+            )

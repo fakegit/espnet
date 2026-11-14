@@ -7,6 +7,8 @@ import os
 
 import numpy as np
 
+from espnet2.torch_utils.safe_torch_load import safe_torch_load
+
 
 def main():
     if args.log is not None:
@@ -70,7 +72,23 @@ def main():
 
         # sum
         for path in last:
-            states = torch.load(path, map_location=torch.device("cpu"))["model"]
+            # Validate checkpoint path for security
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Checkpoint file not found: {path}")
+
+            # Check file extension and size for basic validation
+            if not path.endswith((".pt", ".pth", ".bin")):
+                print(f"Warning: Untrusted file extension: {path}")
+                # Currently, snapshots do not have any extension so it is not possible
+                # to raise error when files do not have a pytorch-file extension
+                # TODO(nelson): Add extension to snapshots.
+                # raise ValueError(f"Untrusted file extension: {path}")
+
+            file_size = os.path.getsize(path)
+            if file_size > 10 * 1024 * 1024 * 1024:  # 10GB limit
+                raise ValueError(f"File too large (>10GB): {path}")
+
+            states = safe_torch_load(path, map_location=torch.device("cpu"))["model"]
             if avg is None:
                 avg = states
             else:

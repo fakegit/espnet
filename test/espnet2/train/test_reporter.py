@@ -1,21 +1,13 @@
-from distutils.version import LooseVersion
 import logging
-from pathlib import Path
 import uuid
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
-from espnet2.train.reporter import aggregate
-from espnet2.train.reporter import Average
-from espnet2.train.reporter import ReportedValue
-from espnet2.train.reporter import Reporter
-
-if LooseVersion(torch.__version__) >= LooseVersion("1.1.0"):
-    from torch.utils.tensorboard import SummaryWriter
-else:
-    from tensorboardX import SummaryWriter
+from espnet2.train.reporter import Average, ReportedValue, Reporter, aggregate
 
 
 @pytest.mark.parametrize("weight1,weight2", [(None, None), (19, np.array(9))])
@@ -58,7 +50,7 @@ def test_register(weight1, weight2):
             desired[k] /= weight1 + weight2
 
     for k1, k2 in reporter.get_all_keys():
-        if k2 in ("time", "total_count"):
+        if k2 in ("time", "total_count", "gpu_max_cached_mem_GB", "gpu_cached_mem_GB"):
             continue
         np.testing.assert_allclose(reporter.get_value(k1, k2), desired[k2])
 
@@ -280,7 +272,7 @@ def test_matplotlib_plot(tmp_path: Path):
 def test_tensorboard_add_scalar(tmp_path: Path):
     reporter = Reporter()
     reporter.set_epoch(1)
-    key1 = uuid.uuid4().hex
+    key1 = "train"
     with reporter.observe(key1) as sub:
         stats1 = {"aa": 0.6}
         sub.register(stats1)
@@ -320,6 +312,52 @@ def test_state_dict():
     state2 = reporter2.state_dict()
 
     assert state == state2
+
+
+def test_state_dict_weights_only_compatible():
+    """state_dict() must be torch.save/load(weights_only=True) compatible.
+
+    Reporter stores numpy scalars (np.float64 from np.nanmean) and
+    datetime.timedelta values in its internal stats dict.  The state_dict()
+    method must serialise these into native Python types so that the
+    checkpoint can be loaded with weights_only=True without raising an
+    UnpicklingError.
+
+    We register plain float values so that typechecked passes; aggregate()
+    internally produces np.float64 via np.nanmean, which is the problematic
+    type that state_dict() must convert.
+    """
+    import io
+
+    reporter = Reporter()
+    reporter.set_epoch(1)
+    with reporter.observe("train") as sub:
+        # Register two steps so aggregate() calls np.nanmean and returns
+        # np.float64 (not a plain Python float).
+        sub.register({"loss": 0.5, "acc": 0.9})
+        sub.next()
+        sub.register({"loss": 0.3, "acc": 0.8})
+        sub.next()
+
+    state = reporter.state_dict()
+
+    buf = io.BytesIO()
+    torch.save(state, buf)
+    buf.seek(0)
+    # This must not raise with weights_only=True
+    loaded_state = torch.load(buf, weights_only=True)
+
+    # Round-trip into a new Reporter and verify behavior is preserved
+    reporter2 = Reporter()
+    reporter2.load_state_dict(loaded_state)
+
+    assert reporter2.get_epoch() == reporter.get_epoch()
+    assert reporter2.get_value("train", "loss") == reporter.get_value("train", "loss")
+    assert reporter2.get_value("train", "acc") == reporter.get_value("train", "acc")
+    # log_message must work (requires timedelta to be restored)
+    msg = reporter2.log_message()
+    assert "loss" in msg
+    assert "acc" in msg
 
 
 def test_get_epoch():

@@ -4,16 +4,16 @@
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
 import argparse
-from distutils.util import strtobool
 import logging
+from distutils.util import strtobool
 
-import kaldiio
 import numpy
 import resampy
+from omniio import kaldi as kaldi_io
 
-from espnet.transform.spectrogram import logmelspectrogram
-from espnet.utils.cli_utils import get_commandline_args
-from espnet.utils.cli_writers import file_writer_helper
+from espnet2.legacy.transform.spectrogram import logmelspectrogram
+from espnet2.legacy.utils.cli_utils import get_commandline_args
+from espnet2.legacy.utils.cli_writers import file_writer_helper
 from espnet2.utils.types import int_or_none
 
 
@@ -39,7 +39,7 @@ def get_parser():
         type=int_or_none,
         default=None,
         nargs="?",
-        help="Analisys window length in point",
+        help="Analysis window length in point",
     )
     parser.add_argument(
         "--window",
@@ -100,15 +100,16 @@ def main():
         logging.basicConfig(level=logging.WARN, format=logfmt)
     logging.info(get_commandline_args())
 
-    with kaldiio.ReadHelper(
-        args.rspecifier, segments=args.segments
-    ) as reader, file_writer_helper(
-        args.wspecifier,
-        filetype=args.filetype,
-        write_num_frames=args.write_num_frames,
-        compress=args.compress,
-        compression_method=args.compression_method,
-    ) as writer:
+    with (
+        kaldi_io.ReadHelper(args.rspecifier, segments=args.segments) as reader,
+        file_writer_helper(
+            args.wspecifier,
+            filetype=args.filetype,
+            write_num_frames=args.write_num_frames,
+            compress=args.compress,
+            compression_method=args.compression_method,
+        ) as writer,
+    ):
         for utt_id, (rate, array) in reader:
             array = array.astype(numpy.float32)
             if args.fs is not None and rate != args.fs:

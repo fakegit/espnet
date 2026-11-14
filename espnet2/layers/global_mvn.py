@@ -1,14 +1,13 @@
 from pathlib import Path
-from typing import Tuple
-from typing import Union
+from typing import Tuple, Union
 
 import numpy as np
 import torch
-from typeguard import check_argument_types
+from typeguard import typechecked
 
-from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
 from espnet2.layers.abs_normalize import AbsNormalize
 from espnet2.layers.inversible_interface import InversibleInterface
+from espnet2.legacy.nets.pytorch_backend.nets_utils import make_pad_mask
 
 
 class GlobalMVN(AbsNormalize, InversibleInterface):
@@ -23,6 +22,7 @@ class GlobalMVN(AbsNormalize, InversibleInterface):
         eps:
     """
 
+    @typechecked
     def __init__(
         self,
         stats_file: Union[Path, str],
@@ -30,7 +30,6 @@ class GlobalMVN(AbsNormalize, InversibleInterface):
         norm_vars: bool = True,
         eps: float = 1.0e-20,
     ):
-        assert check_argument_types()
         super().__init__()
         self.norm_means = norm_means
         self.norm_vars = norm_vars
@@ -53,8 +52,17 @@ class GlobalMVN(AbsNormalize, InversibleInterface):
             var = sum_square_v / count - mean * mean
         std = np.sqrt(np.maximum(var, eps))
 
-        self.register_buffer("mean", torch.from_numpy(mean))
-        self.register_buffer("std", torch.from_numpy(std))
+        if isinstance(mean, np.ndarray):
+            mean = torch.from_numpy(mean)
+        else:
+            mean = torch.tensor(mean).float()
+        if isinstance(std, np.ndarray):
+            std = torch.from_numpy(std)
+        else:
+            std = torch.tensor(std).float()
+
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
 
     def extra_repr(self):
         return (
@@ -75,23 +83,23 @@ class GlobalMVN(AbsNormalize, InversibleInterface):
             ilens = x.new_full([x.size(0)], x.size(1))
         norm_means = self.norm_means
         norm_vars = self.norm_vars
-        self.mean = self.mean.to(x.device, x.dtype)
-        self.std = self.std.to(x.device, x.dtype)
+        mean = self.mean.to(x.device, x.dtype)
+        std = self.std.to(x.device, x.dtype)
         mask = make_pad_mask(ilens, x, 1)
 
         # feat: (B, T, D)
         if norm_means:
             if x.requires_grad:
-                x = x - self.mean
+                x = x - mean
             else:
-                x -= self.mean
+                x -= mean
         if x.requires_grad:
             x = x.masked_fill(mask, 0.0)
         else:
             x.masked_fill_(mask, 0.0)
 
         if norm_vars:
-            x /= self.std
+            x /= std
 
         return x, ilens
 
@@ -102,8 +110,8 @@ class GlobalMVN(AbsNormalize, InversibleInterface):
             ilens = x.new_full([x.size(0)], x.size(1))
         norm_means = self.norm_means
         norm_vars = self.norm_vars
-        self.mean = self.mean.to(x.device, x.dtype)
-        self.std = self.std.to(x.device, x.dtype)
+        mean = self.mean.to(x.device, x.dtype)
+        std = self.std.to(x.device, x.dtype)
         mask = make_pad_mask(ilens, x, 1)
 
         if x.requires_grad:
@@ -112,10 +120,10 @@ class GlobalMVN(AbsNormalize, InversibleInterface):
             x.masked_fill_(mask, 0.0)
 
         if norm_vars:
-            x *= self.std
+            x *= std
 
         # feat: (B, T, D)
         if norm_means:
-            x += self.mean
+            x += mean
             x.masked_fill_(make_pad_mask(ilens, x, 1), 0.0)
         return x, ilens

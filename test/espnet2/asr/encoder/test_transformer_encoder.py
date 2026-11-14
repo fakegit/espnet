@@ -1,27 +1,69 @@
 import pytest
 import torch
 
+from espnet2.asr.ctc import CTC
 from espnet2.asr.encoder.transformer_encoder import TransformerEncoder
 
 
 @pytest.mark.parametrize("input_layer", ["linear", "conv2d", "embed", None])
 @pytest.mark.parametrize("positionwise_layer_type", ["conv1d", "conv1d-linear"])
-def test_Encoder_forward_backward(input_layer, positionwise_layer_type):
+@pytest.mark.parametrize("qk_norm", [True, False])
+@pytest.mark.parametrize(
+    "interctc_layer_idx, interctc_use_conditioning",
+    [
+        ([], False),
+        ([1], False),
+        ([1], True),
+    ],
+)
+def test_Encoder_forward_backward(
+    input_layer,
+    positionwise_layer_type,
+    qk_norm,
+    interctc_layer_idx,
+    interctc_use_conditioning,
+):
     encoder = TransformerEncoder(
         20,
         output_size=40,
         input_layer=input_layer,
         positionwise_layer_type=positionwise_layer_type,
+        interctc_layer_idx=interctc_layer_idx,
+        interctc_use_conditioning=interctc_use_conditioning,
+        qk_norm=qk_norm,
     )
     if input_layer == "embed":
         x = torch.randint(0, 10, [2, 10])
-    elif input_layer is None:
-        x = torch.randn(2, 10, 40, requires_grad=True)
     else:
         x = torch.randn(2, 10, 20, requires_grad=True)
     x_lens = torch.LongTensor([10, 8])
-    y, _, _ = encoder(x, x_lens)
+    if len(interctc_layer_idx) > 0:
+        ctc = None
+        if interctc_use_conditioning:
+            vocab_size = 5
+            output_size = encoder.output_size()
+            ctc = CTC(odim=vocab_size, encoder_output_size=output_size)
+            encoder.conditioning_layer = torch.nn.Linear(vocab_size, output_size)
+        y, _, _ = encoder(x, x_lens, ctc=ctc)
+        y = y[0]
+    else:
+        y, _, _ = encoder(x, x_lens)
     y.sum().backward()
+
+
+def test_encoder_invalid_interctc_layer_idx():
+    with pytest.raises(AssertionError):
+        TransformerEncoder(
+            20,
+            num_blocks=2,
+            interctc_layer_idx=[0, 1],
+        )
+    with pytest.raises(AssertionError):
+        TransformerEncoder(
+            20,
+            num_blocks=2,
+            interctc_layer_idx=[1, 2],
+        )
 
 
 def test_Encoder_output_size():
@@ -32,3 +74,38 @@ def test_Encoder_output_size():
 def test_Encoder_invalid_type():
     with pytest.raises(ValueError):
         TransformerEncoder(20, input_layer="fff")
+
+
+def test_use_sdpa_reaches_the_attention_and_matches_the_default():
+    """`use_sdpa` has to be forwarded, and must not change the output.
+
+    The flag reaches PyTorch's scaled_dot_product_attention; checking every
+    module that carries it, rather than one attribute name, keeps this honest
+    if a layer gains a second attention.
+    """
+    x = torch.randn(2, 120, 80)
+    lengths = torch.tensor([120, 95])
+
+    def build(**kwargs):
+        torch.manual_seed(0)
+        return TransformerEncoder(
+            80,
+            output_size=32,
+            attention_heads=2,
+            linear_units=32,
+            num_blocks=2,
+            use_flash_attn=False,
+            **kwargs,
+        )
+
+    # eval() so dropout does not make the two forward passes draw different
+    # masks: the point of the comparison is the attention implementation.
+    sdpa_encoder = build(use_sdpa=True).eval()
+    attentions = [m for m in sdpa_encoder.modules() if hasattr(m, "use_sdpa")]
+    assert attentions and all(m.use_sdpa for m in attentions)
+
+    with torch.no_grad():
+        default_out, _, _ = build().eval()(x, lengths)
+        sdpa_out, _, _ = sdpa_encoder(x, lengths)
+    assert default_out.shape == sdpa_out.shape
+    assert torch.allclose(default_out, sdpa_out, atol=1e-5)

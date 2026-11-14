@@ -1,21 +1,16 @@
-from abc import ABC
-from abc import abstractmethod
+"""Abstract task module."""
+
 import argparse
-from dataclasses import dataclass
-from distutils.version import LooseVersion
 import functools
+import itertools
 import logging
 import os
-from pathlib import Path
 import sys
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Sequence
-from typing import Tuple
-from typing import Union
+import tempfile
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import humanfriendly
 import numpy as np
@@ -23,62 +18,93 @@ import torch
 import torch.multiprocessing
 import torch.nn
 import torch.optim
-from torch.utils.data import DataLoader
-from typeguard import check_argument_types
-from typeguard import check_return_type
-import wandb
 import yaml
+from packaging.version import parse as V
+from torch.utils.data import DataLoader
+from typeguard import typechecked
 
-from espnet import __version__
-from espnet.utils.cli_utils import get_commandline_args
+from espnet2 import __version__
+from espnet2.fileio.read_text import read_2columns_text
 from espnet2.iterators.abs_iter_factory import AbsIterFactory
+from espnet2.iterators.category_chunk_iter_factory import CategoryChunkIterFactory
+from espnet2.iterators.category_iter_factory import CategoryIterFactory
 from espnet2.iterators.chunk_iter_factory import ChunkIterFactory
 from espnet2.iterators.multiple_iter_factory import MultipleIterFactory
 from espnet2.iterators.sequence_iter_factory import SequenceIterFactory
+from espnet2.layers.create_adapter import create_adapter
+from espnet2.legacy.utils.cli_utils import get_commandline_args
 from espnet2.main_funcs.collect_stats import collect_stats
+from espnet2.optimizers.optim_groups import configure_optimizer
 from espnet2.optimizers.sgd import SGD
-from espnet2.samplers.build_batch_sampler import BATCH_TYPES
-from espnet2.samplers.build_batch_sampler import build_batch_sampler
+from espnet2.samplers.build_batch_sampler import (
+    BATCH_TYPES,
+    CATEGORY_BATCH_TYPES,
+    build_batch_sampler,
+    build_category_batch_sampler,
+)
 from espnet2.samplers.unsorted_batch_sampler import UnsortedBatchSampler
+from espnet2.schedulers.cosine_anneal_warmup_restart import (
+    CosineAnnealingWarmupRestarts,
+)
+from espnet2.schedulers.exponential_decay_warmup import ExponentialDecayWarmup
 from espnet2.schedulers.noam_lr import NoamLR
+from espnet2.schedulers.piecewise_linear_warmup_lr import PiecewiseLinearWarmupLR
+from espnet2.schedulers.tristage_lr import TristageLR
 from espnet2.schedulers.warmup_lr import WarmupLR
+from espnet2.schedulers.warmup_reducelronplateau import WarmupReduceLROnPlateau
+from espnet2.schedulers.warmup_step_lr import WarmupStepLR
+from espnet2.torch_utils.compile_modules import compile_modules
+from espnet2.torch_utils.initialize import INITIALIZATIONS
 from espnet2.torch_utils.load_pretrained_model import load_pretrained_model
 from espnet2.torch_utils.model_summary import model_summary
 from espnet2.torch_utils.pytorch_version import pytorch_cudnn_version
+from espnet2.torch_utils.safe_torch_load import UnsafeLoadRefusedError, safe_torch_load
 from espnet2.torch_utils.set_all_random_seed import set_all_random_seed
 from espnet2.train.abs_espnet_model import AbsESPnetModel
 from espnet2.train.class_choices import ClassChoices
-from espnet2.train.dataset import AbsDataset
-from espnet2.train.dataset import DATA_TYPES
-from espnet2.train.dataset import ESPnetDataset
-from espnet2.train.distributed_utils import DistributedOption
-from espnet2.train.distributed_utils import free_port
-from espnet2.train.distributed_utils import get_master_port
-from espnet2.train.distributed_utils import get_node_rank
-from espnet2.train.distributed_utils import get_num_nodes
-from espnet2.train.distributed_utils import resolve_distributed_mode
-from espnet2.train.iterable_dataset import IterableESPnetDataset
+from espnet2.train.dataset import (
+    DATA_TYPES,
+    AbsDataset,
+    ESPnetDataset,
+    ESPnetMultiTaskDataset,
+)
+from espnet2.train.distributed_utils import (
+    DistributedOption,
+    free_port,
+    get_master_port,
+    get_node_rank,
+    get_num_nodes,
+    resolve_distributed_mode,
+)
+from espnet2.train.iterable_dataset import (  # noqa
+    IterableESPnetDataset,
+    SplicedIterableESPnetDataset,
+)
 from espnet2.train.trainer import Trainer
-from espnet2.utils.build_dataclass import build_dataclass
 from espnet2.utils import config_argparse
+from espnet2.utils.build_dataclass import build_dataclass
 from espnet2.utils.get_default_kwargs import get_default_kwargs
 from espnet2.utils.nested_dict_action import NestedDictAction
-from espnet2.utils.types import humanfriendly_parse_size_or_none
-from espnet2.utils.types import int_or_none
-from espnet2.utils.types import str2bool
-from espnet2.utils.types import str2triple_str
-from espnet2.utils.types import str_or_int
-from espnet2.utils.types import str_or_none
+from espnet2.utils.types import (
+    humanfriendly_parse_size_or_none,
+    int_or_none,
+    str2bool,
+    str2triple_str,
+    str_or_int,
+    str_or_none,
+)
 from espnet2.utils.yaml_no_alias_safe_dump import yaml_no_alias_safe_dump
 
-if LooseVersion(torch.__version__) >= LooseVersion("1.5.0"):
-    from torch.multiprocessing.spawn import ProcessContext
-else:
-    from torch.multiprocessing.spawn import SpawnContext as ProcessContext
+try:
+    import wandb
+except Exception:
+    wandb = None
 
+from torch.multiprocessing.spawn import ProcessContext
 
 optim_classes = dict(
     adam=torch.optim.Adam,
+    adamw=torch.optim.AdamW,
     sgd=SGD,
     adadelta=torch.optim.Adadelta,
     adagrad=torch.optim.Adagrad,
@@ -87,9 +113,8 @@ optim_classes = dict(
     lbfgs=torch.optim.LBFGS,
     rmsprop=torch.optim.RMSprop,
     rprop=torch.optim.Rprop,
+    radam=torch.optim.RAdam,
 )
-if LooseVersion(torch.__version__) >= LooseVersion("1.2.0"):
-    optim_classes["adamw"] = torch.optim.AdamW
 try:
     import torch_optimizer
 
@@ -104,10 +129,14 @@ try:
         # torch_optimizer<=0.0.1a10 doesn't support
         # qhadam=torch_optimizer.QHAdam,
         qhm=torch_optimizer.QHM,
-        radam=torch_optimizer.RAdam,
         sgdw=torch_optimizer.SGDW,
         yogi=torch_optimizer.Yogi,
     )
+    if V(torch_optimizer.__version__) < V("0.2.0"):
+        # From 0.2.0, RAdam is dropped
+        optim_classes.update(
+            radam=torch_optimizer.RAdam,
+        )
     del torch_optimizer
 except ImportError:
     pass
@@ -136,22 +165,28 @@ scheduler_classes = dict(
     multisteplr=torch.optim.lr_scheduler.MultiStepLR,
     exponentiallr=torch.optim.lr_scheduler.ExponentialLR,
     CosineAnnealingLR=torch.optim.lr_scheduler.CosineAnnealingLR,
+    noamlr=NoamLR,
+    warmuplr=WarmupLR,
+    piecewiselinearwarmuplr=PiecewiseLinearWarmupLR,
+    warmupsteplr=WarmupStepLR,
+    warmupReducelronplateau=WarmupReduceLROnPlateau,
+    cycliclr=torch.optim.lr_scheduler.CyclicLR,
+    onecyclelr=torch.optim.lr_scheduler.OneCycleLR,
+    CosineAnnealingWarmRestarts=torch.optim.lr_scheduler.CosineAnnealingWarmRestarts,
+    CosineAnnealingWarmupRestarts=CosineAnnealingWarmupRestarts,
+    tristagelr=TristageLR,
+    ExponentialDecayWarmup=ExponentialDecayWarmup,
 )
-if LooseVersion(torch.__version__) >= LooseVersion("1.1.0"):
-    scheduler_classes.update(
-        noamlr=NoamLR,
-        warmuplr=WarmupLR,
-    )
-if LooseVersion(torch.__version__) >= LooseVersion("1.3.0"):
-    CosineAnnealingWarmRestarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
-    scheduler_classes.update(
-        cycliclr=torch.optim.lr_scheduler.CyclicLR,
-        onecyclelr=torch.optim.lr_scheduler.OneCycleLR,
-        CosineAnnealingWarmRestarts=CosineAnnealingWarmRestarts,
-    )
 # To lower keys
 optim_classes = {k.lower(): v for k, v in optim_classes.items()}
 scheduler_classes = {k.lower(): v for k, v in scheduler_classes.items()}
+
+
+CONFIG_REPLACE_MAP = [
+    ("text_cleaner", "cleaner"),
+    ("g2p_type", "g2p"),
+    ("aux_task_names", "aux_ctc_tasks"),
+]
 
 
 @dataclass
@@ -165,10 +200,43 @@ class IteratorOptions:
     batch_type: str
     max_cache_size: float
     max_cache_fd: int
+    allow_multi_rates: bool
     distributed: bool
     num_batches: Optional[int]
     num_iters_per_epoch: Optional[int]
     train: bool
+
+
+def _drop_init_this_version_removed(args: argparse.Namespace) -> None:
+    """Ignore an initialization this version no longer has, when loading.
+
+    `--init` says how to fill the parameters *before* training. Loading a
+    trained model fills them from the checkpoint instead, so the setting has
+    no effect here - but `build_model` applies it anyway and raises on a
+    value it does not recognise, which is how a model published with
+    `init: chainer` stopped loading when that choice was removed in June 2025
+    (9e9897a4703). espnet_model_zoo's daily run found it on jv_openslr35,
+    published against espnet 0.9.7.
+
+    A value this version does know is left alone: it is wasted work before
+    the state dict overwrites it, but `load_state_dict` here is not strict,
+    so a parameter the checkpoint does not carry keeps what the
+    initialization gave it.
+
+    Only called when there is a checkpoint to load. Building from a config
+    alone leaves the model with whatever the initialization gives it, so an
+    unknown one there is a real problem and still says so.
+    """
+    init = getattr(args, "init", None)
+    if init is None or init in INITIALIZATIONS:
+        return
+    logging.warning(
+        "this model was trained with init=%s, which this version of espnet "
+        "does not have. Ignoring it: the weights come from the checkpoint, "
+        "not from an initialization.",
+        init,
+    )
+    args.init = None
 
 
 class AbsTask(ABC):
@@ -187,6 +255,65 @@ class AbsTask(ABC):
     @abstractmethod
     def add_task_arguments(cls, parser: argparse.ArgumentParser):
         pass
+
+    @classmethod
+    def add_augmentation_arguments(
+        cls,
+        parser: argparse.ArgumentParser,
+        short_noise_thres: bool = True,
+    ):
+        """Add the on-the-fly RIR and noise augmentation options.
+
+        Adds --rir_scp, --rir_apply_prob, --noise_scp, --noise_apply_prob,
+        --noise_db_range and, if short_noise_thres is True, --short_noise_thres
+        to the "Data augmentation related" group. A task calls this from its
+        add_task_arguments and passes the values to its preprocessor in
+        build_preprocess_fn.
+
+        Args:
+            parser: The parser of the task.
+            short_noise_thres: Whether to add --short_noise_thres.
+        """
+        group = parser.add_argument_group("Data augmentation related")
+        group.add_argument(
+            "--rir_scp",
+            type=str_or_none,
+            default=None,
+            help="The file path of rir scp file.",
+        )
+        group.add_argument(
+            "--rir_apply_prob",
+            type=float,
+            default=1.0,
+            help="The probability for applying RIR convolution.",
+        )
+        group.add_argument(
+            "--noise_scp",
+            type=str_or_none,
+            default=None,
+            help="The file path of noise scp file.",
+        )
+        group.add_argument(
+            "--noise_apply_prob",
+            type=float,
+            default=1.0,
+            help="The probability for adding noise.",
+        )
+        group.add_argument(
+            "--noise_db_range",
+            type=str,
+            default="13_15",
+            help="The range of signal-to-noise ratio (SNR) in decibels, "
+            "e.g. 13_15 samples the SNR uniformly from [13, 15].",
+        )
+        if short_noise_thres:
+            group.add_argument(
+                "--short_noise_thres",
+                type=float,
+                default=0.5,
+                help="If len(noise) / len(speech) is smaller than this threshold "
+                "during dynamic mixing, a warning will be displayed.",
+            )
 
     @classmethod
     @abstractmethod
@@ -257,9 +384,8 @@ class AbsTask(ABC):
         raise NotImplementedError
 
     @classmethod
+    @typechecked
     def get_parser(cls) -> config_argparse.ArgumentParser:
-        assert check_argument_types()
-
         class ArgumentDefaultsRawTextHelpFormatter(
             argparse.RawTextHelpFormatter,
             argparse.ArgumentDefaultsHelpFormatter,
@@ -293,6 +419,12 @@ class AbsTask(ABC):
             help="The verbose level of logging",
         )
         group.add_argument(
+            "--drop_last_iter",
+            type=str2bool,
+            default=False,
+            help="Exclude the minibatch with leftovers.",
+        )
+        group.add_argument(
             "--dry_run",
             type=str2bool,
             default=False,
@@ -301,8 +433,15 @@ class AbsTask(ABC):
         group.add_argument(
             "--iterator_type",
             type=str,
-            choices=["sequence", "chunk", "task", "none"],
+            choices=["sequence", "category", "chunk", "task", "none"],
             default="sequence",
+            help="Specify iterator type",
+        )
+        group.add_argument(
+            "--valid_iterator_type",
+            type=str,
+            choices=["sequence", "category", "chunk", "task", "none"],
+            default=None,
             help="Specify iterator type",
         )
 
@@ -325,7 +464,8 @@ class AbsTask(ABC):
             type=int,
             default=3,
             help="The number images to plot the outputs from attention. "
-            "This option makes sense only when attention-based model",
+            "This option makes sense only when attention-based model. "
+            "We can also disable the attention plot by setting it 0",
         )
 
         group = parser.add_argument_group("distributed training related")
@@ -405,6 +545,32 @@ class AbsTask(ABC):
             type=str2bool,
             help="Enable sharded training provided by fairscale",
         )
+        group.add_argument(
+            "--use_deepspeed",
+            default=False,
+            type=str2bool,
+            help="Enable deepspeed for training",
+        )
+        group.add_argument(
+            "--deepspeed_config",
+            default=None,
+            type=str,
+            help="deepspeed training config",
+        )
+        group.add_argument(
+            "--gradient_as_bucket_view",
+            default=True,
+            type=str2bool,
+            help="Enable gradient_as_bucket_view in DDP",
+        )
+        group.add_argument(
+            "--ddp_comm_hook",
+            default=None,
+            type=str_or_none,
+            choices=["none", "fp16_compress_hook", "bf16_compress_hook"],
+            help="DDP communication hook from "
+            "torch.distributed.algorithms.ddp_comm_hooks.default_hooks",
+        )
 
         group = parser.add_argument_group("cudnn mode related")
         group.add_argument(
@@ -424,6 +590,12 @@ class AbsTask(ABC):
             type=str2bool,
             default=True,
             help="Enable cudnn-deterministic mode",
+        )
+        group.add_argument(
+            "--use_tf32",
+            type=str2bool,
+            default=False,
+            help="Enable TensorFloat32 on CUDA and CUDNN",
         )
 
         group = parser.add_argument_group("collect stats mode related")
@@ -495,6 +667,12 @@ class AbsTask(ABC):
             help="Remove previous snapshots excluding the n-best scored epochs",
         )
         group.add_argument(
+            "--nbest_averaging_interval",
+            type=int,
+            default=0,
+            help="The epoch interval to apply model averaging and save nbest models",
+        )
+        group.add_argument(
             "--grad_clip",
             type=float,
             default=5.0,
@@ -545,6 +723,22 @@ class AbsTask(ABC):
             help="Enable Automatic Mixed Precision. This feature requires pytorch>=1.6",
         )
         group.add_argument(
+            "--torch_compile_modules",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Submodules of the model to compile with torch.compile for "
+            "training, as dotted paths, e.g. 'frontend encoder decoder'. Each one "
+            "is compiled in place, so the state dict does not change.",
+        )
+        group.add_argument(
+            "--torch_compile_conf",
+            action=NestedDictAction,
+            default=dict(),
+            help="Keyword arguments of torch.compile for --torch_compile_modules, "
+            "e.g. mode=max-autotune.",
+        )
+        group.add_argument(
             "--log_interval",
             type=int_or_none,
             default=None,
@@ -553,10 +747,22 @@ class AbsTask(ABC):
             "of training samples automatically .",
         )
         group.add_argument(
+            "--use_matplotlib",
+            type=str2bool,
+            default=True,
+            help="Enable matplotlib logging",
+        )
+        group.add_argument(
             "--use_tensorboard",
             type=str2bool,
             default=True,
             help="Enable tensorboard logging",
+        )
+        group.add_argument(
+            "--create_graph_in_tensorboard",
+            type=str2bool,
+            default=False,
+            help="Whether to create graph in tensorboard",
         )
         group.add_argument(
             "--use_wandb",
@@ -577,10 +783,65 @@ class AbsTask(ABC):
             help="Specify wandb id",
         )
         group.add_argument(
+            "--wandb_entity",
+            type=str,
+            default=None,
+            help="Specify wandb entity",
+        )
+        group.add_argument(
+            "--wandb_name",
+            type=str,
+            default=None,
+            help="Specify wandb run name",
+        )
+        group.add_argument(
+            "--wandb_model_log_interval",
+            type=int,
+            default=-1,
+            help="Set the model log period",
+        )
+        group.add_argument(
+            "--wandb_allow_val_change",
+            type=str2bool,
+            default=True,
+            help="Allow wandb config values to be changed after initialization",
+        )
+        group.add_argument(
             "--detect_anomaly",
             type=str2bool,
             default=False,
             help="Set torch.autograd.set_detect_anomaly",
+        )
+        group.add_argument(
+            "--use_adapter",
+            type=str2bool,
+            default=False,
+            help="Enable efficient finetuning, see (https://arxiv.org/abs/2106.09685) "
+            "for large pre-trained foundation models, like Whisper and SSL models",
+        )
+        group.add_argument(
+            "--adapter",
+            type=str,
+            default="lora",
+            help="Adapter Name",
+            choices=["lora", "houlsby"],
+        )
+        group.add_argument(
+            "--save_strategy",
+            type=str,
+            default="all",
+            help="The strategy to save parameters. Default: 'all' \n"
+            "'all': save all parameters\n"
+            "'adapter_only': save only adapter parameters,"
+            " without other parameters like downstream model\n"
+            "'required_grad_only': save only parameters with requires_grad=True\n",
+            choices=["all", "adapter_only", "required_grad_only"],
+        )
+        group.add_argument(
+            "--adapter_conf",
+            action=NestedDictAction,
+            default=dict(),
+            help="Configuration for efficient finetuning",
         )
 
         group = parser.add_argument_group("Pretraining model related")
@@ -606,6 +867,12 @@ class AbsTask(ABC):
             "  --init_param some/where/model.pth:decoder:decoder:decoder.embed\n",
         )
         group.add_argument(
+            "--ignore_init_mismatch",
+            type=str2bool,
+            default=False,
+            help="Ignore size mismatch when loading pre-trained model",
+        )
+        group.add_argument(
             "--freeze_param",
             type=str,
             default=[],
@@ -625,7 +892,7 @@ class AbsTask(ABC):
             type=int,
             default=20,
             help="The mini-batch size used for training. Used if batch_type='unsorted',"
-            " 'sorted', or 'folded'.",
+            " 'sorted', or 'folded', or 'catbel'.",
         )
         group.add_argument(
             "--valid_batch_size",
@@ -645,6 +912,60 @@ class AbsTask(ABC):
             default=None,
             help="If not given, the value of --batch_bins is used",
         )
+        group.add_argument(
+            "--category_sample_size",
+            type=int,
+            default=10,
+            help="The sample size for category chunk iterator",
+        )
+        group.add_argument(
+            "--upsampling_factor",
+            type=float,
+            default=0.5,
+            help="Upsampling factor for low-resource categories when using "
+            "batch_type='catpow' (CategoryPowerSampler). "
+            "Lower values (-> 0) increase sampling of rare categories, "
+            "higher values (-> 1.0) reduce upsampling. Default: 0.5",
+        )
+        group.add_argument(
+            "--category_upsampling_factor",
+            type=float,
+            default=0.5,
+            help="Upsampling factor for datasets with fewer samples when using "
+            "batch_type='catpow_balance_dataset' (CategoryDatasetPowerSampler). "
+            "Lower values (-> 0) increase sampling of rare categories, "
+            "higher values (-> 1.0) reduce upsampling. Default: 0.5",
+        )
+        group.add_argument(
+            "--dataset_upsampling_factor",
+            type=float,
+            default=0.5,
+            help="Upsampling factor for low-resource datasets when using "
+            "batch_type='catpow_balance_dataset' (CategoryDatasetPowerSampler). "
+            "Lower values (-> 0) increase sampling of rare datasets, "
+            "higher values (-> 1.0) reduce upsampling. Default: 0.5",
+        )
+        group.add_argument(
+            "--dataset_scaling_factor",
+            type=float,
+            default=1.2,
+            help="Used when batch_type='catpow' (CategoryPowerSampler) or "
+            "'catpow_balance_dataset' (CategoryDatasetPowerSampler), "
+            "control the scaled dataset size after upsampling",
+        )
+        group.add_argument(
+            "--max_batch_size",
+            type=int_or_none,
+            default=None,
+            help="Max batch size for CategoryPowerSampler "
+            "and CategoryDatasetPowerSampler",
+        )
+        group.add_argument(
+            "--min_batch_size",
+            type=int,
+            default=1,
+            help="Min batch size for batch samplers.",
+        )
 
         group.add_argument("--train_shape_file", type=str, action="append", default=[])
         group.add_argument("--valid_shape_file", type=str, action="append", default=[])
@@ -657,14 +978,14 @@ class AbsTask(ABC):
             "--batch_type",
             type=str,
             default="folded",
-            choices=list(BATCH_TYPES),
+            choices=list(BATCH_TYPES) + list(CATEGORY_BATCH_TYPES),
             help=_batch_type_help,
         )
         group.add_argument(
             "--valid_batch_type",
             type=str_or_none,
             default=None,
-            choices=list(BATCH_TYPES) + [None],
+            choices=list(BATCH_TYPES) + list(CATEGORY_BATCH_TYPES) + [None],
             help="If not given, the value of --batch_type is used",
         )
         group.add_argument("--fold_length", type=int, action="append", default=[])
@@ -675,6 +996,13 @@ class AbsTask(ABC):
             choices=["descending", "ascending"],
             help="Sort the samples in each mini-batches by the sample "
             'lengths. To enable this, "shape_file" must have the length information.',
+        )
+        group.add_argument(
+            "--shuffle_within_batch",
+            type=str2bool,
+            default=False,
+            help="Shuffles wholes batches in sample-wise. Required for"
+            "Classification tasks normally.",
         )
         group.add_argument(
             "--sort_batch",
@@ -717,6 +1045,70 @@ class AbsTask(ABC):
             help="Shuffle in the specified number of chunks and generate mini-batches "
             "More larger this value, more randomness can be obtained.",
         )
+        group.add_argument(
+            "--chunk_excluded_key_prefixes",
+            type=str,
+            nargs="+",
+            default=[],
+            help="List of key prefixes. Keys that satisfy either condition below "
+            "will be excluded from the length consistency check in ChunkIterFactory:\n"
+            "  - exactly match one of the prefixes in `chunk_excluded_key_prefixes`\n"
+            "  - have one of the prefixes in `chunk_excluded_key_prefixes` and "
+            "end with numbers",
+        )
+        group.add_argument(
+            "--chunk_default_fs",
+            type=int_or_none,
+            default=None,
+            help="Default sampling rate used for the chunk length. Will be used to "
+            "adaptively adjust the chunk length for data of different sampling rates. "
+            "(If None, the chunk length will be fixed.)",
+        )
+        group.add_argument(
+            "--chunk_max_abs_length",
+            type=int_or_none,
+            default=None,
+            help="Maximum number of samples per chunk for all sampling rates",
+        )
+        group.add_argument(
+            "--chunk_left_context",
+            type=int,
+            default=0,
+            help="Number of samples (at --chunk_default_fs if given) that the "
+            "chunks of --chunk_left_context_keys get in front of the chunk, with "
+            "zeros before the start of the sequence; the other keys (e.g. the "
+            "labels) keep the chunk. For a model that removes them after using "
+            "them as history (e.g. the context of --wav_augment_conf). 0: none.",
+        )
+        group.add_argument(
+            "--chunk_left_context_keys",
+            type=str,
+            nargs="+",
+            default=["speech"],
+            help="Keys whose chunks get --chunk_left_context.",
+        )
+        group.add_argument(
+            "--chunk_random_access",
+            type=str2bool,
+            default=False,
+            help="With --iterator_type chunk: read each chunk on its own from the "
+            "data instead of splitting whole loaded sequences. A sequence of L "
+            "samples (first shape file) gives the chunks [i*S, i*S+W), W = "
+            "--chunk_length (a single length), S = int(W * --chunk_shift_ratio), "
+            "for i = 0 .. (L - W) // S. Loaders with read_span (Omni-IO, RTTM) "
+            "read only the chunk. The chunks, ordered by sequence id, form "
+            "mini-batches as --batch_type unsorted does, and the mini-batches are "
+            "shuffled each epoch as the sequence iterator shuffles them. "
+            "--chunk_left_context C: the chunks of --chunk_left_context_keys are "
+            "read as [i*S - C, i*S + W), zeros before the start of the sequence. "
+            "Chunks have one fixed length, so --chunk_default_fs is not supported.",
+        )
+        group.add_argument(
+            "--chunk_discard_short_samples",
+            type=str2bool,
+            default=True,
+            help="Discard samples shorter than the minimum chunk length",
+        )
 
         group = parser.add_argument_group("Dataset related")
         _data_path_and_name_and_type_help = (
@@ -745,6 +1137,14 @@ class AbsTask(ABC):
             default=[],
         )
         group.add_argument(
+            "--multi_task_dataset",
+            type=str2bool,
+            default=False,
+            help="If true, input data is organized by json file. "
+            "This is usually used for multi-task training, like SpeechLM task"
+            "e.g., --train_data_path_and_name_and_type foo.json,foo_task,json",
+        )
+        group.add_argument(
             "--allow_variable_data_keys",
             type=str2bool,
             default=False,
@@ -762,8 +1162,14 @@ class AbsTask(ABC):
             type=int,
             default=32,
             help="The maximum number of file descriptors to be kept "
-            "as opened for ark files. "
-            "This feature is only valid when data type is 'kaldi_ark'.",
+            "as opened for ark files or Omni-IO bin files. "
+            "This feature is only valid when data type is 'kaldi_ark' or 'omniio'.",
+        )
+        group.add_argument(
+            "--allow_multi_rates",
+            type=str2bool,
+            default=False,
+            help="Whether to allow audios to have different sampling rates",
         )
         group.add_argument(
             "--valid_max_cache_size",
@@ -774,6 +1180,21 @@ class AbsTask(ABC):
         )
 
         group = parser.add_argument_group("Optimizer related")
+        group.add_argument(
+            "--exclude_weight_decay",
+            type=str2bool,
+            default=False,
+            help="Exclude weight decay in optimizer for model bias, normalization, "
+            "or other special parameters",
+        )
+        group.add_argument(
+            "--exclude_weight_decay_conf",
+            action=NestedDictAction,
+            default=dict(),
+            help="The keyword arguments for configuring weight decay in optimizer. "
+            "e.g., 'bias_weight_decay': False will set zero weight decay for bias "
+            "params. See also espnet2.optimizers.optim_groups.configure_optimizer.",
+        )
         for i in range(1, cls.num_optimizers + 1):
             suf = "" if i == 1 else str(i)
             group.add_argument(
@@ -806,7 +1227,6 @@ class AbsTask(ABC):
         cls.trainer.add_arguments(parser)
         cls.add_task_arguments(parser)
 
-        assert check_return_type(parser)
         return parser
 
     @classmethod
@@ -830,7 +1250,15 @@ class AbsTask(ABC):
                 params=model.parameters(), optim=optim_class, **args.optim_conf
             )
         else:
-            optim = optim_class(model.parameters(), **args.optim_conf)
+            if args.exclude_weight_decay:
+                optim = configure_optimizer(
+                    model,
+                    optim_class,
+                    args.optim_conf,
+                    args.exclude_weight_decay_conf,
+                )
+            else:
+                optim = optim_class(model.parameters(), **args.optim_conf)
 
         optimizers = [optim]
         return optimizers
@@ -841,6 +1269,7 @@ class AbsTask(ABC):
         return "required", "print_config", "config", "ngpu"
 
     @classmethod
+    @typechecked
     def get_default_config(cls) -> Dict[str, Any]:
         """Return the configuration as dict.
 
@@ -854,7 +1283,6 @@ class AbsTask(ABC):
             return _cls
 
         # This method is used only for --print_config
-        assert check_argument_types()
         parser = cls.get_parser()
         args, _ = parser.parse_known_args()
         config = vars(args)
@@ -885,6 +1313,21 @@ class AbsTask(ABC):
             if getattr(args, class_choices.name) is not None:
                 class_obj = class_choices.get_class(getattr(args, class_choices.name))
                 conf = get_default_kwargs(class_obj)
+
+                # remove duplicate arguments
+                for k in CONFIG_REPLACE_MAP:
+                    if k[0] in conf and k[1] in config:
+                        conf.pop(k[0])
+                    elif k[0] in conf:
+                        conf[k[1]] = conf.pop(k[0])
+
+                remove_keys = []
+                for k in conf:
+                    if k in config:
+                        remove_keys.append(k)
+                for k in remove_keys:
+                    conf.pop(k)
+
                 name = class_choices.name
                 # Overwrite the default by the arguments,
                 conf.update(config[f"{name}_conf"])
@@ -893,8 +1336,8 @@ class AbsTask(ABC):
         return config
 
     @classmethod
+    @typechecked
     def check_required_command_args(cls, args: argparse.Namespace):
-        assert check_argument_types()
         for k in vars(args):
             if "-" in k:
                 raise RuntimeError(f'Use "_" instead of "-": parser.get_parser("{k}")')
@@ -915,6 +1358,7 @@ class AbsTask(ABC):
             sys.exit(2)
 
     @classmethod
+    @typechecked
     def check_task_requirements(
         cls,
         dataset: Union[AbsDataset, IterableESPnetDataset],
@@ -923,7 +1367,6 @@ class AbsTask(ABC):
         inference: bool = False,
     ) -> None:
         """Check if the dataset satisfy the requirement of current Task"""
-        assert check_argument_types()
         mes = (
             f"If you intend to use an additional input, modify "
             f'"{cls.__name__}.required_data_names()" or '
@@ -949,15 +1392,19 @@ class AbsTask(ABC):
                     )
 
     @classmethod
+    @typechecked
     def print_config(cls, file=sys.stdout) -> None:
-        assert check_argument_types()
         # Shows the config: e.g. python train.py asr --print_config
         config = cls.get_default_config()
         file.write(yaml_no_alias_safe_dump(config, indent=4, sort_keys=False))
 
     @classmethod
-    def main(cls, args: argparse.Namespace = None, cmd: Sequence[str] = None):
-        assert check_argument_types()
+    @typechecked
+    def main(
+        cls,
+        args: Optional[argparse.Namespace] = None,
+        cmd: Optional[Sequence[str]] = None,
+    ):
         print(get_commandline_args(), file=sys.stderr)
         if args is None:
             parser = cls.get_parser()
@@ -1002,11 +1449,25 @@ class AbsTask(ABC):
             node_rank = get_node_rank(args.dist_rank, args.dist_launcher)
 
             # The following block is copied from:
-            # https://github.com/pytorch/pytorch/blob/master/torch/multiprocessing/spawn.py
-            error_queues = []
+            # https://github.com/pytorch/pytorch/blob/master/torch/
+            # multiprocessing/spawn.py
+            error_files = []
             processes = []
             mp = torch.multiprocessing.get_context("spawn")
             for i in range(args.ngpu):
+
+                # Each process is assigned a file to write tracebacks to.  We
+                # use the file being non-empty to indicate an exception
+                # occurred (vs an expected shutdown).  Note: this previously
+                # used a multiprocessing.Queue but that can be prone to
+                # deadlocks, so we went with a simpler solution for a one-shot
+                # message between processes.
+                tf = tempfile.NamedTemporaryFile(
+                    prefix="pytorch-errorfile-", suffix=".pickle", delete=False
+                )
+                tf.close()
+                os.unlink(tf.name)
+
                 # Copy args
                 local_args = argparse.Namespace(**vars(args))
 
@@ -1021,14 +1482,14 @@ class AbsTask(ABC):
                 )
                 process.start()
                 processes.append(process)
-                error_queues.append(mp.SimpleQueue())
+                error_files.append(tf.name)
             # Loop on join until it returns True or raises an exception.
-            while not ProcessContext(processes, error_queues).join():
+            while not ProcessContext(processes, error_files).join():
                 pass
 
     @classmethod
+    @typechecked
     def main_worker(cls, args: argparse.Namespace):
-        assert check_argument_types()
 
         # 0. Init distributed process
         distributed_option = build_dataclass(DistributedOption, args)
@@ -1074,49 +1535,77 @@ class AbsTask(ABC):
             logging.info("Invoking torch.autograd.set_detect_anomaly(True)")
             torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-        # 2. Build model
-        model = cls.build_model(args=args)
-        if not isinstance(model, AbsESPnetModel):
-            raise RuntimeError(
-                f"model must inherit {AbsESPnetModel.__name__}, but got {type(model)}"
+        if args.use_tf32:
+            # Accelerate matmul at the cost of precision.
+            # Only effective with Ampere GPUs and above
+            # https://pytorch.org/docs/stable/notes/cuda.html
+            assert not args.use_amp, "amp is not compatible with tf32"
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            logging.info("Using TensorFloat32 at the cost of matmul precision")
+
+        if (
+            args.collect_stats
+            and getattr(args, "model_conf", None) is not None
+            and not args.model_conf.get("extract_feats_in_collect_stats", True)
+        ):
+            model = None
+            logging.info("Skipping model building in collect_stats stage.")
+        else:
+            # 2. Build model
+            model = cls.build_model(args=args)
+            if not isinstance(model, AbsESPnetModel):
+                raise RuntimeError(
+                    f"model must inherit {AbsESPnetModel.__name__},"
+                    f" but got {type(model)}"
+                )
+            model = model.to(
+                dtype=getattr(torch, args.train_dtype),
+                device="cuda" if args.ngpu > 0 else "cpu",
             )
-        model = model.to(
-            dtype=getattr(torch, args.train_dtype),
-            device="cuda" if args.ngpu > 0 else "cpu",
-        )
-        for t in args.freeze_param:
-            for k, p in model.named_parameters():
-                if k.startswith(t + ".") or k == t:
-                    logging.info(f"Setting {k}.requires_grad = False")
-                    p.requires_grad = False
+            for t in args.freeze_param:
+                for k, p in model.named_parameters():
+                    if k.startswith(t + ".") or k == t:
+                        logging.info(f"Setting {k}.requires_grad = False")
+                        p.requires_grad = False
 
-        # 3. Build optimizer
-        optimizers = cls.build_optimizers(args, model=model)
+            # Use adapter to finetune the large pre-trained foundation models
+            if getattr(args, "use_adapter", False):
+                create_adapter(model, args.adapter, args.adapter_conf)
 
-        # 4. Build schedulers
-        schedulers = []
-        for i, optim in enumerate(optimizers, 1):
-            suf = "" if i == 1 else str(i)
-            name = getattr(args, f"scheduler{suf}")
-            conf = getattr(args, f"scheduler{suf}_conf")
-            if name is not None:
-                cls_ = scheduler_classes.get(name)
-                if cls_ is None:
-                    raise ValueError(
-                        f"must be one of {list(scheduler_classes)}: {name}"
-                    )
-                scheduler = cls_(optim, **conf)
-            else:
-                scheduler = None
+            # Compile the chosen submodules for training (not for collect_stats)
+            if getattr(args, "torch_compile_modules", None) and not args.collect_stats:
+                compile_modules(
+                    model, args.torch_compile_modules, args.torch_compile_conf
+                )
 
-            schedulers.append(scheduler)
+            # 3. Build optimizer
+            optimizers = cls.build_optimizers(args, model=model)
 
-        logging.info(pytorch_cudnn_version())
-        logging.info(model_summary(model))
-        for i, (o, s) in enumerate(zip(optimizers, schedulers), 1):
-            suf = "" if i == 1 else str(i)
-            logging.info(f"Optimizer{suf}:\n{o}")
-            logging.info(f"Scheduler{suf}: {s}")
+            # 4. Build schedulers
+            schedulers = []
+            for i, optim in enumerate(optimizers, 1):
+                suf = "" if i == 1 else str(i)
+                name = getattr(args, f"scheduler{suf}")
+                conf = getattr(args, f"scheduler{suf}_conf")
+                if name is not None:
+                    cls_ = scheduler_classes.get(name)
+                    if cls_ is None:
+                        raise ValueError(
+                            f"must be one of {list(scheduler_classes)}: {name}"
+                        )
+                    scheduler = cls_(optim, **conf)
+                else:
+                    scheduler = None
+
+                schedulers.append(scheduler)
+
+            logging.info(pytorch_cudnn_version())
+            logging.info(model_summary(model))
+            for i, (o, s) in enumerate(zip(optimizers, schedulers), 1):
+                suf = "" if i == 1 else str(i)
+                logging.info(f"Optimizer{suf}:\n{o}")
+                logging.info(f"Scheduler{suf}: {s}")
 
         # 5. Dump "args" to config.yaml
         # NOTE(kamo): "args" should be saved after object-buildings are done
@@ -1129,19 +1618,6 @@ class AbsTask(ABC):
                     f'Saving the configuration in {output_dir / "config.yaml"}'
                 )
                 yaml_no_alias_safe_dump(vars(args), f, indent=4, sort_keys=False)
-
-        # 6. Loads pre-trained model
-        for p in args.init_param:
-            logging.info(f"Loading pretrained params from {p}")
-            load_pretrained_model(
-                model=model,
-                init_param=p,
-                # NOTE(kamo): "cuda" for torch.load always indicates cuda:0
-                #   in PyTorch<=1.4
-                map_location=f"cuda:{torch.cuda.current_device()}"
-                if args.ngpu > 0
-                else "cpu",
-            )
 
         if args.dry_run:
             pass
@@ -1163,6 +1639,10 @@ class AbsTask(ABC):
             else:
                 valid_key_file = None
 
+            if model and not getattr(model, "extract_feats_in_collect_stats", True):
+                model = None
+                logging.info("Skipping collect_feats in collect_stats stage.")
+
             collect_stats(
                 model=model,
                 train_iter=cls.build_streaming_iterator(
@@ -1175,6 +1655,8 @@ class AbsTask(ABC):
                     ngpu=args.ngpu,
                     preprocess_fn=cls.build_preprocess_fn(args, train=False),
                     collate_fn=cls.build_collate_fn(args, train=False),
+                    mode="train",
+                    multi_task_dataset=args.multi_task_dataset,
                 ),
                 valid_iter=cls.build_streaming_iterator(
                     data_path_and_name_and_type=args.valid_data_path_and_name_and_type,
@@ -1186,6 +1668,8 @@ class AbsTask(ABC):
                     ngpu=args.ngpu,
                     preprocess_fn=cls.build_preprocess_fn(args, train=False),
                     collate_fn=cls.build_collate_fn(args, train=False),
+                    mode="valid",
+                    multi_task_dataset=args.multi_task_dataset,
                 ),
                 output_dir=output_dir,
                 ngpu=args.ngpu,
@@ -1193,6 +1677,21 @@ class AbsTask(ABC):
                 write_collected_feats=args.write_collected_feats,
             )
         else:
+            # 6. Loads pre-trained model
+            for p in args.init_param:
+                logging.info(f"Loading pretrained params from {p}")
+                load_pretrained_model(
+                    model=model,
+                    init_param=p,
+                    ignore_init_mismatch=args.ignore_init_mismatch,
+                    # NOTE(kamo): "cuda" for torch.load always indicates cuda:0
+                    #   in PyTorch<=1.4
+                    map_location=(
+                        f"cuda:{torch.cuda.current_device()}"
+                        if args.ngpu > 0
+                        else "cpu"
+                    ),
+                )
 
             # 7. Build iterator factories
             if args.multiple_iterator:
@@ -1212,6 +1711,10 @@ class AbsTask(ABC):
                 distributed_option=distributed_option,
                 mode="valid",
             )
+            if not args.use_matplotlib and args.num_att_plot != 0:
+                args.num_att_plot = 0
+                logging.info("--use_matplotlib false => Changing --num_att_plot to 0")
+
             if args.num_att_plot != 0:
                 plot_attention_iter_factory = cls.build_iter_factory(
                     args=args,
@@ -1223,38 +1726,65 @@ class AbsTask(ABC):
 
             # 8. Start training
             if args.use_wandb:
+                if wandb is None:
+                    raise RuntimeError("Please install wandb")
+
+                try:
+                    wandb.login()
+                except wandb.errors.UsageError:
+                    logging.info("wandb not configured! run `wandb login` to enable")
+                    args.use_wandb = False
+
+            if args.use_wandb:
                 if (
                     not distributed_option.distributed
                     or distributed_option.dist_rank == 0
                 ):
                     if args.wandb_project is None:
-                        project = (
-                            "ESPnet_"
-                            + cls.__name__
-                            + str(Path(".").resolve()).replace("/", "_")
-                        )
+                        project = "ESPnet_" + cls.__name__
                     else:
                         project = args.wandb_project
-                    if args.wandb_id is None:
-                        wandb_id = str(output_dir).replace("/", "_")
-                    else:
-                        wandb_id = args.wandb_id
+
+                    # Wandb server generates a random name, if args.wandb_name is None
+                    name = args.wandb_name
 
                     wandb.init(
+                        entity=args.wandb_entity,
                         project=project,
-                        dir=output_dir,
-                        id=wandb_id,
-                        resume="allow",
+                        name=name,
+                        dir=str(output_dir),
+                        id=args.wandb_id,
+                        resume=args.resume,
                     )
-                    wandb.config.update(args)
+                    wandb.config.update(
+                        args,
+                        allow_val_change=args.wandb_allow_val_change,
+                    )
                 else:
                     # wandb also supports grouping for distributed training,
-                    # but we only logs aggregated data,
+                    # but we only log aggregated data,
                     # so it's enough to perform on rank0 node.
                     args.use_wandb = False
 
             # Don't give args to trainer.run() directly!!!
             # Instead of it, define "Options" object and build here.
+
+            if args.use_deepspeed:
+                if not distributed_option.distributed:
+                    logging.warning(
+                        "DeepSpeed is for distributed training. E.g., --ngpu > 1 "
+                        "Switch back to the normal trainer."
+                    )
+                elif cls.trainer != Trainer:
+                    raise ValueError(
+                        "only default trainer is compatible with deepspeed"
+                    )
+                else:
+                    from espnet2.train.deepspeed_trainer import DeepSpeedTrainer
+
+                    cls.trainer = DeepSpeedTrainer
+                    distributed_option.init_deepspeed()
+
             trainer_options = cls.trainer.build_options(args)
             cls.trainer.run(
                 model=model,
@@ -1266,6 +1796,9 @@ class AbsTask(ABC):
                 trainer_options=trainer_options,
                 distributed_option=distributed_option,
             )
+
+            if args.use_wandb and wandb.run:
+                wandb.finish()
 
     @classmethod
     def build_iter_options(
@@ -1284,6 +1817,7 @@ class AbsTask(ABC):
             batch_type = args.batch_type
             max_cache_size = args.max_cache_size
             max_cache_fd = args.max_cache_fd
+            allow_multi_rates = args.allow_multi_rates
             distributed = distributed_option.distributed
             num_batches = None
             num_iters_per_epoch = args.num_iters_per_epoch
@@ -1313,6 +1847,7 @@ class AbsTask(ABC):
             else:
                 max_cache_size = args.valid_max_cache_size
             max_cache_fd = args.max_cache_fd
+            allow_multi_rates = args.allow_multi_rates
             distributed = distributed_option.distributed
             num_batches = None
             num_iters_per_epoch = None
@@ -1328,6 +1863,7 @@ class AbsTask(ABC):
             batch_bins = 0
             num_batches = args.num_att_plot
             max_cache_fd = args.max_cache_fd
+            allow_multi_rates = args.allow_multi_rates
             # num_att_plot should be a few sample ~ 3, so cache all data.
             max_cache_size = np.inf if args.max_cache_size != 0.0 else 0.0
             # always False because plot_attention performs on RANK0
@@ -1348,18 +1884,20 @@ class AbsTask(ABC):
             num_batches=num_batches,
             max_cache_size=max_cache_size,
             max_cache_fd=max_cache_fd,
+            allow_multi_rates=allow_multi_rates,
             distributed=distributed,
             num_iters_per_epoch=num_iters_per_epoch,
             train=train,
         )
 
     @classmethod
+    @typechecked
     def build_iter_factory(
         cls,
         args: argparse.Namespace,
         distributed_option: DistributedOption,
         mode: str,
-        kwargs: dict = None,
+        kwargs: Optional[dict] = None,
     ) -> AbsIterFactory:
         """Build a factory object of mini-batch iterator.
 
@@ -1382,10 +1920,9 @@ class AbsTask(ABC):
         e.g. If The number of mini-batches equals to 4, the following two are same:
 
         - 1 epoch without "--num_iters_per_epoch"
-        - 4 epoch with "--num_iters_per_epoch" == 4
+        - 4 epoch with "--num_iters_per_epoch" == 1
 
         """
-        assert check_argument_types()
         iter_options = cls.build_iter_options(args, distributed_option, mode)
 
         # Overwrite iter_options if any kwargs is given
@@ -1393,55 +1930,86 @@ class AbsTask(ABC):
             for k, v in kwargs.items():
                 setattr(iter_options, k, v)
 
-        if args.iterator_type == "sequence":
+        if mode == "valid" and args.valid_iterator_type is not None:
+            iterator_type = args.valid_iterator_type
+        else:
+            iterator_type = args.iterator_type
+
+        if iterator_type == "sequence":
             return cls.build_sequence_iter_factory(
                 args=args,
                 iter_options=iter_options,
                 mode=mode,
             )
-        elif args.iterator_type == "chunk":
+        elif iterator_type == "category":
+            return cls.build_category_iter_factory(
+                args=args,
+                iter_options=iter_options,
+                mode=mode,
+            )
+        elif iterator_type == "chunk":
             return cls.build_chunk_iter_factory(
                 args=args,
                 iter_options=iter_options,
                 mode=mode,
             )
-        elif args.iterator_type == "task":
+        elif iterator_type == "category_chunk":
+            return cls.build_category_chunk_iter_factory(
+                args=args,
+                iter_options=iter_options,
+                mode=mode,
+            )
+        elif iterator_type == "task":
             return cls.build_task_iter_factory(
                 args=args,
                 iter_options=iter_options,
                 mode=mode,
             )
         else:
-            raise RuntimeError(f"Not supported: iterator_type={args.iterator_type}")
+            raise RuntimeError(f"Not supported: iterator_type={iterator_type}")
 
     @classmethod
-    def build_sequence_iter_factory(
-        cls, args: argparse.Namespace, iter_options: IteratorOptions, mode: str
-    ) -> AbsIterFactory:
-        assert check_argument_types()
+    @typechecked
+    def build_dataset(
+        cls,
+        args: argparse.Namespace,
+        iter_options: IteratorOptions,
+        keys_to_load: Optional[Set[Union[int, str]]] = None,
+    ) -> AbsDataset:
+        if args.multi_task_dataset:
+            dataset_class = ESPnetMultiTaskDataset
+        else:
+            dataset_class = ESPnetDataset
 
-        dataset = ESPnetDataset(
+        dataset = dataset_class(
             iter_options.data_path_and_name_and_type,
             float_dtype=args.train_dtype,
             preprocess=iter_options.preprocess_fn,
             max_cache_size=iter_options.max_cache_size,
             max_cache_fd=iter_options.max_cache_fd,
+            allow_multi_rates=iter_options.allow_multi_rates,
+            keys_to_load=keys_to_load,
         )
         cls.check_task_requirements(
             dataset, args.allow_variable_data_keys, train=iter_options.train
         )
+        return dataset
 
-        if Path(
-            Path(iter_options.data_path_and_name_and_type[0][0]).parent, "utt2category"
-        ).exists():
-            utt2category_file = str(
-                Path(
-                    Path(iter_options.data_path_and_name_and_type[0][0]).parent,
-                    "utt2category",
-                )
-            )
+    @classmethod
+    @typechecked
+    def build_sequence_iter_factory(
+        cls, args: argparse.Namespace, iter_options: IteratorOptions, mode: str
+    ) -> AbsIterFactory:
+
+        utt2category_file = (
+            Path(iter_options.data_path_and_name_and_type[0][0]).parent / "utt2category"
+        )
+        if utt2category_file.exists():
+            utt2category_file = str(utt2category_file)
+            logging.warning("Reading " + utt2category_file)
         else:
             utt2category_file = None
+
         batch_sampler = build_batch_sampler(
             type=iter_options.batch_type,
             shape_files=iter_options.shape_files,
@@ -1450,14 +2018,180 @@ class AbsTask(ABC):
             batch_bins=iter_options.batch_bins,
             sort_in_batch=args.sort_in_batch,
             sort_batch=args.sort_batch,
-            drop_last=False,
-            min_batch_size=torch.distributed.get_world_size()
-            if iter_options.distributed
-            else 1,
+            drop_last=args.drop_last_iter,
+            min_batch_size=(
+                torch.distributed.get_world_size()
+                if iter_options.distributed
+                else args.min_batch_size
+            ),
             utt2category_file=utt2category_file,
         )
 
         batches = list(batch_sampler)
+        if iter_options.num_batches is not None:
+            batches = batches[: iter_options.num_batches]
+
+        bs_list = [len(batch) for batch in batches]
+
+        logging.info(f"[{mode}] Batch sampler: {batch_sampler}")
+        logging.info(
+            f"[{mode}] mini-batch sizes summary: N-batch={len(bs_list)}, "
+            f"mean={np.mean(bs_list):.1f}, min={np.min(bs_list)}, max={np.max(bs_list)}"
+        )
+
+        # Shard mini-batches for distributed training
+        if iter_options.distributed:
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+            for batch in batches:
+                if len(batch) < world_size:
+                    raise RuntimeError(
+                        f"The batch-size must be equal or more than world_size: "
+                        f"{len(batch)} < {world_size}"
+                    )
+            batches = [batch[rank::world_size] for batch in batches]
+
+        # Build dataset after sharding to reduce memory usage
+        # This is very helpful for large-scale training
+        dataset = cls.build_dataset(
+            args,
+            iter_options,
+            set(itertools.chain(*batches)),
+        )
+        logging.info(f"[{mode}] dataset:\n{dataset}")
+
+        return SequenceIterFactory(
+            dataset=dataset,
+            batches=batches,
+            seed=args.seed,
+            num_iters_per_epoch=iter_options.num_iters_per_epoch,
+            shuffle=iter_options.train,
+            shuffle_within_batch=args.shuffle_within_batch,
+            num_workers=args.num_workers,
+            collate_fn=iter_options.collate_fn,
+            pin_memory=args.ngpu > 0,
+        )
+
+    @classmethod
+    @typechecked
+    def build_category_iter_factory(
+        cls, args: argparse.Namespace, iter_options: IteratorOptions, mode: str
+    ) -> AbsIterFactory:
+
+        dataset = ESPnetDataset(
+            iter_options.data_path_and_name_and_type,
+            float_dtype=args.train_dtype,
+            preprocess=iter_options.preprocess_fn,
+            max_cache_size=iter_options.max_cache_size,
+            max_cache_fd=iter_options.max_cache_fd,
+            allow_multi_rates=iter_options.allow_multi_rates,
+        )
+        cls.check_task_requirements(
+            dataset, args.allow_variable_data_keys, train=iter_options.train
+        )
+
+        parent_dir = str(Path(iter_options.data_path_and_name_and_type[0][0]).parent)
+
+        if Path(parent_dir, "category2utt").exists():
+            category2utt_file = str(Path(parent_dir, "category2utt"))
+        else:
+            category2utt_file = None
+            raise ValueError(
+                "category2utt mandatory for category iterator, but not found"
+            )
+
+        if (
+            iter_options.batch_type in CATEGORY_BATCH_TYPES
+            or iter_options.batch_type == "folded"
+        ):
+            # Note(qingzheng): Handle category-based batch sampling for category
+            # iterator type.
+            #
+            # This covers two scenarios:
+            # 1. Explicit category batch types (catbel, catpow, catpow_balance_dataset):
+            #    Use the specified category sampler directly.
+            # 2. Legacy "folded" batch type with category iterator:
+            #    In older configurations, when iterator_type=category was set,
+            #    they typically does not specify the batch_type, which makes the
+            #    batch_type default to "folded". However, the intended behavior
+            #    in the case of setting iterator_type to category, is to use
+            #    category-balanced sampler (catbel). We maintain backward
+            #    compatibility by mapping the batch_type "folded" to "catbel"
+            #    in the case of setting iterator_type to "category".
+
+            if iter_options.batch_type == "folded":
+                logging.warning(
+                    "Detected iterator_type='category' with batch_type='folded'. "
+                    "In older ESPnet versions (< 202509), when iterator_type was "
+                    "set to 'category', the batch_type would default to 'folded' as "
+                    "the older design does not require the batch_type to be specified, "
+                    "but the intended behavior was to use category-balanced sampling "
+                    "(catbel batch sampler). We map 'folded' to 'catbel' to maintain "
+                    "this behavior. If you actually want to use the folded batch "
+                    "sampler, please set iterator_type='sequence' and "
+                    "batch_type='folded' instead."
+                )
+
+            batch_sampler, sampler_args = build_category_batch_sampler(
+                type=(
+                    iter_options.batch_type
+                    if iter_options.batch_type != "folded"
+                    else "catbel"
+                ),
+                batch_size=iter_options.batch_size,
+                batch_bins=iter_options.batch_bins,
+                shape_files=iter_options.shape_files,
+                min_batch_size=(
+                    torch.distributed.get_world_size()
+                    if iter_options.distributed
+                    else args.min_batch_size
+                ),
+                max_batch_size=args.max_batch_size,
+                upsampling_factor=args.upsampling_factor,
+                category_upsampling_factor=args.category_upsampling_factor,
+                dataset_upsampling_factor=args.dataset_upsampling_factor,
+                dataset_scaling_factor=args.dataset_scaling_factor,
+                drop_last=args.drop_last_iter,
+                category2utt_file=category2utt_file,
+                dataset2utt_parent_dir=parent_dir,
+                epoch=1,
+                num_batches=iter_options.num_batches,
+                distributed=iter_options.distributed,
+            )
+        elif iter_options.batch_type == "unsorted":
+            # For plot attention
+            if len(iter_options.shape_files) == 0:
+                key_file = iter_options.data_path_and_name_and_type[0][0]
+            else:
+                key_file = iter_options.shape_files[0]
+            batch_sampler = UnsortedBatchSampler(
+                batch_size=iter_options.batch_size,
+                key_file=key_file,
+            )
+        elif iter_options.batch_type in BATCH_TYPES.keys():
+            # If the batch_type is set to other than the category batch types,
+            # folded, and unsorted, we fallback to treat it as a sequence iterator.
+            logging.warning(
+                f"The batch type {iter_options.batch_type} is not compatible "
+                f"with iterator_type=category. Please use a category batch type. "
+                f"Available category batch types: {CATEGORY_BATCH_TYPES.keys()} "
+                f"Here we fallback to treat it as a sequence iterator."
+            )
+            sequence_iter_factory = cls.build_sequence_iter_factory(
+                args=args,
+                iter_options=iter_options,
+                mode=mode,
+            )
+            return sequence_iter_factory
+        else:
+            raise ValueError(
+                f"batch_type={iter_options.batch_type} is not supported"
+                f"Please specify batch_type in {CATEGORY_BATCH_TYPES.keys()}, "
+                "unsorted."
+            )
+
+        batches = list(batch_sampler)
+
         if iter_options.num_batches is not None:
             batches = batches[: iter_options.num_batches]
 
@@ -1481,25 +2215,103 @@ class AbsTask(ABC):
                     )
             batches = [batch[rank::world_size] for batch in batches]
 
-        return SequenceIterFactory(
-            dataset=dataset,
-            batches=batches,
-            seed=args.seed,
-            num_iters_per_epoch=iter_options.num_iters_per_epoch,
-            shuffle=iter_options.train,
-            num_workers=args.num_workers,
-            collate_fn=iter_options.collate_fn,
-            pin_memory=args.ngpu > 0,
-        )
+        if iter_options.batch_type == "unsorted":
+            # For plot attention
+            return SequenceIterFactory(
+                dataset=dataset,
+                batches=batches,
+                seed=args.seed,
+                num_iters_per_epoch=iter_options.num_iters_per_epoch,
+                shuffle=iter_options.train,
+                shuffle_within_batch=args.shuffle_within_batch,
+                num_workers=args.num_workers,
+                collate_fn=iter_options.collate_fn,
+                pin_memory=args.ngpu > 0,
+            )
+        else:
+            return CategoryIterFactory(
+                dataset=dataset,
+                batches=batches,
+                seed=args.seed,
+                num_iters_per_epoch=iter_options.num_iters_per_epoch,
+                sampler_args=sampler_args,
+                batch_type=(
+                    iter_options.batch_type
+                    if iter_options.batch_type != "folded"
+                    else "catbel"
+                ),
+                shuffle=iter_options.train,
+                num_workers=args.num_workers,
+                collate_fn=iter_options.collate_fn,
+                pin_memory=args.ngpu > 0,
+            )
 
     @classmethod
-    def build_chunk_iter_factory(
+    @typechecked
+    def build_random_access_chunk_iter_factory(
         cls,
         args: argparse.Namespace,
         iter_options: IteratorOptions,
         mode: str,
     ) -> AbsIterFactory:
-        assert check_argument_types()
+        """Chunks read on their own from the data (--chunk_random_access).
+
+        See the help of --chunk_random_access. Each chunk is the dataset item
+        (sequence id, start, end), so only the chunk is read from loaders with
+        read_span; the mini-batches are those of UnsortedBatchSampler over the
+        chunks, and the sequence iterator shuffles them each epoch.
+        """
+        if len(iter_options.shape_files) == 0:
+            raise RuntimeError("--chunk_random_access needs a shape file (lengths)")
+        try:
+            W = int(args.chunk_length)
+        except ValueError:
+            raise ValueError(
+                f"--chunk_random_access needs one --chunk_length: {args.chunk_length}"
+            )
+        S = int(W * args.chunk_shift_ratio)
+        if W <= 0 or S <= 0:
+            raise ValueError(f"chunk length {W} and shift {S} must be positive")
+        if args.chunk_default_fs is not None:
+            raise ValueError(
+                "--chunk_random_access reads chunks of one fixed length: "
+                "--chunk_default_fs is not supported"
+            )
+        C = getattr(args, "chunk_left_context", 0)
+        if C < 0:
+            raise ValueError(f"--chunk_left_context must be >= 0: {C}")
+        lengths = {
+            k: int(v.split(",")[0])
+            for k, v in read_2columns_text(iter_options.shape_files[0]).items()
+        }
+        chunks = [
+            (uid, start, start + W)
+            for uid in sorted(lengths)
+            for start in range(0, lengths[uid] - W + 1, S)
+        ]
+        if len(chunks) == 0:
+            raise RuntimeError(f"no sequence is {W} samples or longer: {mode}")
+        # the split of UnsortedBatchSampler (drop_last=False)
+        N = max(len(chunks) // iter_options.batch_size, 1)
+        batches = [
+            chunks[i * len(chunks) // N : (i + 1) * len(chunks) // N] for i in range(N)
+        ]
+        if iter_options.num_batches is not None:
+            batches = batches[: iter_options.num_batches]
+        logging.info(
+            f"[{mode}] {len(chunks)} chunks of {W} samples (shift {S}) from "
+            f"{len(lengths)} sequences, {len(batches)} mini-batches"
+        )
+        if iter_options.distributed:
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+            for batch in batches:
+                if len(batch) < world_size:
+                    raise RuntimeError(
+                        f"The batch-size must be equal or more than world_size: "
+                        f"{len(batch)} < {world_size}"
+                    )
+            batches = [batch[rank::world_size] for batch in batches]
 
         dataset = ESPnetDataset(
             iter_options.data_path_and_name_and_type,
@@ -1507,6 +2319,47 @@ class AbsTask(ABC):
             preprocess=iter_options.preprocess_fn,
             max_cache_size=iter_options.max_cache_size,
             max_cache_fd=iter_options.max_cache_fd,
+            allow_multi_rates=iter_options.allow_multi_rates,
+        )
+        cls.check_task_requirements(
+            dataset, args.allow_variable_data_keys, train=iter_options.train
+        )
+        if C > 0:
+            dataset.span_left_context = C
+            dataset.span_left_context_keys = set(
+                getattr(args, "chunk_left_context_keys", ["speech"])
+            )
+        logging.info(f"[{mode}] dataset:\n{dataset}")
+        return SequenceIterFactory(
+            dataset=dataset,
+            batches=batches,
+            seed=args.seed,
+            num_iters_per_epoch=iter_options.num_iters_per_epoch,
+            shuffle=iter_options.train,
+            shuffle_within_batch=args.shuffle_within_batch,
+            num_workers=args.num_workers,
+            collate_fn=iter_options.collate_fn,
+            pin_memory=args.ngpu > 0,
+        )
+
+    @classmethod
+    @typechecked
+    def build_chunk_iter_factory(
+        cls,
+        args: argparse.Namespace,
+        iter_options: IteratorOptions,
+        mode: str,
+    ) -> AbsIterFactory:
+        if getattr(args, "chunk_random_access", False):
+            return cls.build_random_access_chunk_iter_factory(args, iter_options, mode)
+
+        dataset = ESPnetDataset(
+            iter_options.data_path_and_name_and_type,
+            float_dtype=args.train_dtype,
+            preprocess=iter_options.preprocess_fn,
+            max_cache_size=iter_options.max_cache_size,
+            max_cache_fd=iter_options.max_cache_fd,
+            allow_multi_rates=iter_options.allow_multi_rates,
         )
         cls.check_task_requirements(
             dataset, args.allow_variable_data_keys, train=iter_options.train
@@ -1562,6 +2415,114 @@ class AbsTask(ABC):
             chunk_length=args.chunk_length,
             chunk_shift_ratio=args.chunk_shift_ratio,
             num_cache_chunks=num_cache_chunks,
+            excluded_key_prefixes=args.chunk_excluded_key_prefixes,
+            default_fs=args.chunk_default_fs,
+            chunk_max_abs_length=args.chunk_max_abs_length,
+            discard_short_samples=args.chunk_discard_short_samples,
+            left_context=getattr(args, "chunk_left_context", 0),
+            left_context_keys=getattr(args, "chunk_left_context_keys", ["speech"]),
+        )
+
+    @classmethod
+    @typechecked
+    def build_category_chunk_iter_factory(
+        cls,
+        args: argparse.Namespace,
+        iter_options: IteratorOptions,
+        mode: str,
+    ) -> AbsIterFactory:
+
+        dataset = ESPnetDataset(
+            iter_options.data_path_and_name_and_type,
+            float_dtype=args.train_dtype,
+            preprocess=iter_options.preprocess_fn,
+            max_cache_size=iter_options.max_cache_size,
+            max_cache_fd=iter_options.max_cache_fd,
+            allow_multi_rates=iter_options.allow_multi_rates,
+        )
+        cls.check_task_requirements(
+            dataset, args.allow_variable_data_keys, train=iter_options.train
+        )
+
+        parent_dir = str(Path(iter_options.data_path_and_name_and_type[0][0]).parent)
+
+        if Path(parent_dir, "category2utt").exists():
+            category2utt_file = str(Path(parent_dir, "category2utt"))
+            logging.warning("Reading " + category2utt_file)
+        else:
+            category2utt_file = None
+
+        batch_sampler, _ = build_category_batch_sampler(
+            type=iter_options.batch_type,
+            batch_size=args.category_sample_size,
+            batch_bins=iter_options.batch_bins,
+            shape_files=iter_options.shape_files,
+            min_batch_size=(
+                torch.distributed.get_world_size()
+                if iter_options.distributed
+                else args.min_batch_size
+            ),
+            max_batch_size=args.max_batch_size,
+            upsampling_factor=args.upsampling_factor,
+            category_upsampling_factor=args.category_upsampling_factor,
+            dataset_upsampling_factor=args.dataset_upsampling_factor,
+            dataset_scaling_factor=args.dataset_scaling_factor,
+            drop_last=args.drop_last_iter,
+            category2utt_file=category2utt_file,
+            dataset2utt_parent_dir=parent_dir,
+            epoch=1,
+            num_batches=iter_options.num_batches,
+            distributed=iter_options.distributed,
+        )
+
+        batches = list(batch_sampler)
+        if iter_options.num_batches is not None:
+            batches = batches[: iter_options.num_batches]
+        logging.info(f"[{mode}] dataset:\n{dataset}")
+
+        if iter_options.distributed:
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+            if len(batches) < world_size:
+                raise RuntimeError("Number of samples is smaller than world_size")
+            if iter_options.batch_size < world_size:
+                raise RuntimeError("batch_size must be equal or more than world_size")
+
+            if rank < iter_options.batch_size % world_size:
+                batch_size = iter_options.batch_size // world_size + 1
+            else:
+                batch_size = iter_options.batch_size // world_size
+            num_cache_chunks = args.num_cache_chunks // world_size
+            # NOTE(kamo): Split whole corpus by sample numbers without considering
+            #   each of the lengths, therefore the number of iteration counts are not
+            #   always equal to each other and the iterations are limitted
+            #   by the fewest iterations.
+            #   i.e. the samples over the counts are discarded.
+            batches = batches[rank::world_size]
+        else:
+            batch_size = iter_options.batch_size
+            num_cache_chunks = args.num_cache_chunks
+
+        return CategoryChunkIterFactory(
+            dataset=dataset,
+            batches=batches,
+            seed=args.seed,
+            batch_size=batch_size,
+            # For chunk iterator,
+            # --num_iters_per_epoch doesn't indicate the number of iterations,
+            # but indicates the number of samples.
+            num_samples_per_epoch=iter_options.num_iters_per_epoch,
+            shuffle=iter_options.train,
+            num_workers=args.num_workers,
+            collate_fn=iter_options.collate_fn,
+            pin_memory=args.ngpu > 0,
+            chunk_length=args.chunk_length,
+            chunk_shift_ratio=args.chunk_shift_ratio,
+            num_cache_chunks=num_cache_chunks,
+            excluded_key_prefixes=args.chunk_excluded_key_prefixes,
+            default_fs=args.chunk_default_fs,
+            chunk_max_abs_length=args.chunk_max_abs_length,
+            discard_short_samples=args.chunk_discard_short_samples,
         )
 
     # NOTE(kamo): Not abstract class
@@ -1601,10 +2562,10 @@ class AbsTask(ABC):
         raise NotImplementedError
 
     @classmethod
+    @typechecked
     def build_multiple_iter_factory(
         cls, args: argparse.Namespace, distributed_option: DistributedOption, mode: str
     ):
-        assert check_argument_types()
         iter_options = cls.build_iter_options(args, distributed_option, mode)
         assert len(iter_options.data_path_and_name_and_type) > 0, len(
             iter_options.data_path_and_name_and_type
@@ -1647,9 +2608,11 @@ class AbsTask(ABC):
             for i in range(num_splits)
         ]
         num_iters_per_epoch_list = [
-            (iter_options.num_iters_per_epoch + i) // num_splits
-            if iter_options.num_iters_per_epoch is not None
-            else None
+            (
+                (iter_options.num_iters_per_epoch + i) // num_splits
+                if iter_options.num_iters_per_epoch is not None
+                else None
+            )
             for i in range(num_splits)
         ]
         max_cache_size = iter_options.max_cache_size / num_splits
@@ -1685,53 +2648,44 @@ class AbsTask(ABC):
         )
 
     @classmethod
+    @typechecked
     def build_streaming_iterator(
         cls,
         data_path_and_name_and_type,
         preprocess_fn,
         collate_fn,
-        key_file: str = None,
+        key_file: Optional[str] = None,
         batch_size: int = 1,
-        dtype: str = np.float32,
+        dtype: Optional[Any] = np.float32,
         num_workers: int = 1,
         allow_variable_data_keys: bool = False,
         ngpu: int = 0,
         inference: bool = False,
+        mode: Optional[str] = None,
+        multi_task_dataset: bool = False,
     ) -> DataLoader:
         """Build DataLoader using iterable dataset"""
-        assert check_argument_types()
         # For backward compatibility for pytorch DataLoader
         if collate_fn is not None:
             kwargs = dict(collate_fn=collate_fn)
         else:
             kwargs = {}
 
-        # IterableDataset is supported from pytorch=1.2
-        if LooseVersion(torch.__version__) >= LooseVersion("1.2"):
-            dataset = IterableESPnetDataset(
-                data_path_and_name_and_type,
-                float_dtype=dtype,
-                preprocess=preprocess_fn,
-                key_file=key_file,
-            )
-            if dataset.apply_utt2category:
-                kwargs.update(batch_size=1)
-            else:
-                kwargs.update(batch_size=batch_size)
+        if multi_task_dataset:
+            dataset_class = ESPnetMultiTaskDataset
         else:
-            dataset = ESPnetDataset(
-                data_path_and_name_and_type,
-                float_dtype=dtype,
-                preprocess=preprocess_fn,
-            )
-            if key_file is None:
-                key_file = data_path_and_name_and_type[0][0]
-            batch_sampler = UnsortedBatchSampler(
-                batch_size=batch_size,
-                key_file=key_file,
-                drop_last=False,
-            )
-            kwargs.update(batch_sampler=batch_sampler)
+            dataset_class = IterableESPnetDataset
+        dataset = dataset_class(
+            data_path_and_name_and_type,
+            float_dtype=dtype,
+            preprocess=preprocess_fn,
+            key_file=key_file,
+        )
+
+        if dataset.apply_utt2category:
+            kwargs.update(batch_size=1)
+        else:
+            kwargs.update(batch_size=batch_size)
 
         cls.check_task_requirements(
             dataset, allow_variable_data_keys, train=False, inference=inference
@@ -1741,42 +2695,124 @@ class AbsTask(ABC):
             dataset=dataset,
             pin_memory=ngpu > 0,
             num_workers=num_workers,
+            sampler=getattr(dataset, "example_list", None),
             **kwargs,
         )
 
     # ~~~~~~~~~ The methods below are mainly used for inference ~~~~~~~~~
     @classmethod
+    @typechecked
     def build_model_from_file(
         cls,
-        config_file: Union[Path, str],
-        model_file: Union[Path, str] = None,
+        config_file: Optional[Union[Path, str]] = None,
+        model_file: Optional[Union[Path, str]] = None,
         device: str = "cpu",
     ) -> Tuple[AbsESPnetModel, argparse.Namespace]:
-        """This method is used for inference or fine-tuning.
+        """Build model from the files.
+
+        This method is used for inference or fine-tuning.
 
         Args:
             config_file: The yaml file saved when training.
             model_file: The model file saved when training.
-            device:
+            device: Device type, "cpu", "mps", "cuda", or "cuda:N".
 
         """
-        assert check_argument_types()
-        config_file = Path(config_file)
+        if config_file is None:
+            assert model_file is not None, (
+                "The argument 'model_file' must be provided "
+                "if the argument 'config_file' is not specified."
+            )
+            config_file = Path(model_file).parent / "config.yaml"
+        else:
+            config_file = Path(config_file)
 
+        logging.info("config file: {}".format(config_file))
         with config_file.open("r", encoding="utf-8") as f:
             args = yaml.safe_load(f)
         args = argparse.Namespace(**args)
+        if model_file is not None:
+            # only when a checkpoint is about to overwrite the parameters;
+            # with none, the initialization is all the model will have
+            _drop_init_this_version_removed(args)
         model = cls.build_model(args)
         if not isinstance(model, AbsESPnetModel):
             raise RuntimeError(
                 f"model must inherit {AbsESPnetModel.__name__}, but got {type(model)}"
             )
-        model.to(device)
+        if device != "mps":
+            model.to(device)
+
+        # For finetuned model, create adapter
+        use_adapter = getattr(args, "use_adapter", False)
+        if use_adapter:
+            create_adapter(model, args.adapter, args.adapter_conf)
+
         if model_file is not None:
             if device == "cuda":
                 # NOTE(kamo): "cuda" for torch.load always indicates cuda:0
                 #   in PyTorch<=1.4
                 device = f"cuda:{torch.cuda.current_device()}"
-            model.load_state_dict(torch.load(model_file, map_location=device))
+            try:
+                state_dict = safe_torch_load(
+                    model_file,
+                    map_location="cpu" if device == "mps" else device,
+                )
+                # for deepspeed checkpoints
+                if "module" in state_dict:
+                    state_dict = state_dict["module"]
+                # for lightning checkpoints
+                if "state_dict" in state_dict:
+                    state_dict = state_dict["state_dict"]
+
+                model.load_state_dict(
+                    state_dict,
+                    strict=False,
+                )
+            except UnsafeLoadRefusedError:
+                raise
+            except RuntimeError:
+                # Note(simpleoier): the following part is to be compatible with
+                #   pretrained model using earlier versions before `0a625088`.
+                #   This RuntimeError is raised by model.load_state_dict above
+                #   (due to key mismatches), not by safe_torch_load.  We reload
+                #   the file here to apply legacy key renaming before retrying.
+                state_dict = safe_torch_load(
+                    model_file, map_location="cpu" if device == "mps" else device
+                )
+                if any(["frontend.upstream.model" in k for k in state_dict.keys()]):
+                    if any(
+                        [
+                            "frontend.upstream.upstream.model" in k
+                            for k in dict(model.named_parameters())
+                        ]
+                    ):
+                        state_dict = {
+                            k.replace(
+                                "frontend.upstream.model",
+                                "frontend.upstream.upstream.model",
+                            ): v
+                            for k, v in state_dict.items()
+                        }
+                        model.load_state_dict(state_dict, strict=not use_adapter)
+                    else:
+                        if any(["postdecoder" in k for k in state_dict.keys()]):
+                            model.load_state_dict(
+                                state_dict,
+                                strict=False,
+                            )
+                        else:
+                            raise
+                else:
+                    if any(["postdecoder" in k for k in state_dict.keys()]):
+                        model.load_state_dict(
+                            state_dict,
+                            strict=False,
+                        )
+                    else:
+                        raise
+
+        if device == "mps":
+            model.to("mps", dtype=torch.float32)
 
         return model, args

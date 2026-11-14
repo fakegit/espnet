@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import logging
-from pathlib import Path
 import sys
-from typing import Iterable
-from typing import Union
+from pathlib import Path
+from typing import Iterable, Union
 
 import numpy as np
 
-from espnet.utils.cli_utils import get_commandline_args
+from espnet2.legacy.utils.cli_utils import get_commandline_args
 
 
 def aggregate_stats_dirs(

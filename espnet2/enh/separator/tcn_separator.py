@@ -1,11 +1,10 @@
 from collections import OrderedDict
-from typing import List
-from typing import Tuple
-from typing import Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch_complex.tensor import ComplexTensor
 
+from espnet2.enh.layers.complex_utils import is_complex
 from espnet2.enh.layers.tcn import TemporalConvNet
 from espnet2.enh.separator.abs_separator import AbsSeparator
 
@@ -15,6 +14,7 @@ class TCNSeparator(AbsSeparator):
         self,
         input_dim: int,
         num_spk: int = 2,
+        predict_noise: bool = False,
         layer: int = 8,
         stack: int = 3,
         bottleneck_dim: int = 128,
@@ -23,12 +23,15 @@ class TCNSeparator(AbsSeparator):
         causal: bool = False,
         norm_type: str = "gLN",
         nonlinear: str = "relu",
+        pre_mask_nonlinear: str = "prelu",
+        masking: bool = True,
     ):
         """Temporal Convolution Separator
 
         Args:
             input_dim: input feature dimension
             num_spk: number of speakers
+            predict_noise: whether to output the estimated noise signal
             layer: int, number of layers in each stack.
             stack: int, number of stacks
             bottleneck_dim: bottleneck dimension
@@ -37,13 +40,16 @@ class TCNSeparator(AbsSeparator):
             causal: bool, defalut False.
             norm_type: str, choose from 'BN', 'gLN', 'cLN'
             nonlinear: the nonlinear function for mask estimation,
-                       select from 'relu', 'tanh', 'sigmoid'
+                       select from 'relu', 'tanh', 'sigmoid', 'linear'
+            pre_mask_nonlinear: the non-linear function before masknet
+            masking: whether to use the masking or mapping based method
         """
         super().__init__()
 
         self._num_spk = num_spk
+        self.predict_noise = predict_noise
 
-        if nonlinear not in ("sigmoid", "relu", "tanh"):
+        if nonlinear not in ("sigmoid", "relu", "tanh", "linear"):
             raise ValueError("Not supporting nonlinear={}".format(nonlinear))
 
         self.tcn = TemporalConvNet(
@@ -53,20 +59,28 @@ class TCNSeparator(AbsSeparator):
             P=kernel,
             X=layer,
             R=stack,
-            C=num_spk,
+            C=num_spk + 1 if predict_noise else num_spk,
             norm_type=norm_type,
             causal=causal,
+            pre_mask_nonlinear=pre_mask_nonlinear,
             mask_nonlinear=nonlinear,
         )
 
+        self.masking = masking
+
     def forward(
-        self, input: Union[torch.Tensor, ComplexTensor], ilens: torch.Tensor
+        self,
+        input: Union[torch.Tensor, ComplexTensor],
+        ilens: torch.Tensor,
+        additional: Optional[Dict] = None,
     ) -> Tuple[List[Union[torch.Tensor, ComplexTensor]], torch.Tensor, OrderedDict]:
         """Forward.
 
         Args:
             input (torch.Tensor or ComplexTensor): Encoded feature [B, T, N]
             ilens (torch.Tensor): input lengths [Batch]
+            additional (Dict or None): other data included in model
+                NOTE: not used in this model
 
         Returns:
             masked (List[Union(torch.Tensor, ComplexTensor)]): [(B, T, N), ...]
@@ -79,7 +93,7 @@ class TCNSeparator(AbsSeparator):
             ]
         """
         # if complex spectrum
-        if isinstance(input, ComplexTensor):
+        if is_complex(input):
             feature = abs(input)
         else:
             feature = input
@@ -89,15 +103,48 @@ class TCNSeparator(AbsSeparator):
 
         masks = self.tcn(feature)  # B, num_spk, N, L
         masks = masks.transpose(2, 3)  # B, num_spk, L, N
-        masks = masks.unbind(dim=1)  # List[B, L, N]
+        if self.predict_noise:
+            *masks, mask_noise = masks.unbind(dim=1)  # List[B, L, N]
+        else:
+            masks = masks.unbind(dim=1)  # List[B, L, N]
 
-        masked = [input * m for m in masks]
+        if self.masking:
+            # masking-based SE
+            masked = [input * m for m in masks]
+        else:
+            # mapping-based SE
+            masked = [m for m in masks]
 
         others = OrderedDict(
             zip(["mask_spk{}".format(i + 1) for i in range(len(masks))], masks)
         )
+        if self.predict_noise:
+            others["noise1"] = input * mask_noise
 
         return masked, ilens, others
+
+    def forward_streaming(self, input_frame: torch.Tensor, buffer=None):
+        # input_frame: B, 1, N
+
+        B, _, N = input_frame.shape
+
+        receptive_field = self.tcn.receptive_field
+
+        if buffer is None:
+            buffer = torch.zeros(
+                (B, receptive_field, N),
+                device=input_frame.device,
+                dtype=input_frame.dtype,
+            )
+
+        buffer = torch.roll(buffer, shifts=-1, dims=1)
+        buffer[:, -1, :] = input_frame[:, 0, :]
+
+        masked, ilens, others = self.forward(buffer, None)
+
+        masked = [m[:, -1, :].unsqueeze(1) for m in masked]
+
+        return masked, buffer, others
 
     @property
     def num_spk(self):

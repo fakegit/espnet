@@ -17,7 +17,7 @@ def stats_file(tmp_path: Path):
     x = np.random.randn(count, 80)
     s = x.sum(0)
     s = np.pad(s, [0, 1], mode="constant", constant_values=count)
-    s2 = (x ** 2).sum(0)
+    s2 = (x**2).sum(0)
     s2 = np.pad(s2, [0, 1], mode="constant", constant_values=0.0)
 
     stats = np.stack([s, s2])
@@ -34,7 +34,7 @@ def stats_file2(tmp_path: Path):
     np.random.seed(0)
     x = np.random.randn(count, 80)
     s = x.sum(0)
-    s2 = (x ** 2).sum(0)
+    s2 = (x**2).sum(0)
 
     np.savez(p, sum=s, sum_square=s2, count=count)
     return p
@@ -117,3 +117,22 @@ def test_new_style_stats_file(stats_file, stats_file2, norm_vars, norm_means):
     y, _ = layer(x)
     y2, _ = layer2(x)
     np.testing.assert_allclose(y.numpy(), y2.numpy())
+
+
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mixed_precision_preserves_statistics(stats_file2, inverse, dtype):
+    layer = GlobalMVN(stats_file2)
+    original = {key: value.clone() for key, value in layer.state_dict().items()}
+    call = layer.inverse if inverse else layer
+    x = torch.randn(2, 3, 80, dtype=torch.float64)
+    lengths = torch.tensor([3, 2])
+    expected, _ = call(x.clone(), lengths)
+
+    call(x.to(dtype), lengths)
+    actual, actual_lengths = call(x.clone(), lengths)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(actual_lengths, lengths)
+    for key, value in layer.state_dict().items():
+        torch.testing.assert_close(value, original[key], rtol=0, atol=0)

@@ -1,32 +1,91 @@
 #!/usr/bin/env python3
 import argparse
 import logging
-from pathlib import Path
 import sys
-from typing import List
-from typing import Optional
-from typing import Sequence
-from typing import Tuple
-from typing import Union
+from itertools import chain
+from pathlib import Path
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import humanfriendly
 import numpy as np
 import torch
+import torchaudio
+import yaml
 from tqdm import trange
-from typeguard import check_argument_types
+from typeguard import typechecked
 
-from espnet.utils.cli_utils import get_commandline_args
+from espnet2.enh.diffusion_enh import ESPnetDiffusionModel
+from espnet2.enh.loss.criterions.tf_domain import FrequencyDomainMSE
+from espnet2.enh.loss.criterions.time_domain import SISNRLoss
+from espnet2.enh.loss.wrappers.pit_solver import PITSolver
+from espnet2.enh.separator.bsrnn_separator import BSRNNSeparator
+from espnet2.enh.separator.tfgridnetv3_separator import TFGridNetV3
+from espnet2.enh.separator.uses_separator import USESSeparator
 from espnet2.fileio.sound_scp import SoundScpWriter
+from espnet2.legacy.utils.cli_utils import get_commandline_args
 from espnet2.tasks.enh import EnhancementTask
+from espnet2.tasks.enh_s2t import EnhS2TTask
 from espnet2.torch_utils.device_funcs import to_device
 from espnet2.torch_utils.set_all_random_seed import set_all_random_seed
+from espnet2.train.abs_espnet_model import AbsESPnetModel
 from espnet2.utils import config_argparse
-from espnet2.utils.types import str2bool
-from espnet2.utils.types import str2triple_str
-from espnet2.utils.types import str_or_none
-
+from espnet2.utils.pretrained import download_pretrained
+from espnet2.utils.types import str2bool, str2triple_str, str_or_none
 
 EPS = torch.finfo(torch.get_default_dtype()).eps
+
+
+def get_train_config(train_config, model_file=None):
+    if train_config is None:
+        assert model_file is not None, (
+            "The argument 'model_file' must be provided "
+            "if the argument 'train_config' is not specified."
+        )
+        train_config = Path(model_file).parent / "config.yaml"
+    else:
+        train_config = Path(train_config)
+    return train_config
+
+
+def recursive_dict_update(dict_org, dict_patch, verbose=False, log_prefix=""):
+    """Update `dict_org` with `dict_patch` in-place recursively."""
+    for key, value in dict_patch.items():
+        if key not in dict_org:
+            if verbose:
+                logging.info(
+                    "Overwriting config: [{}{}]: None -> {}".format(
+                        log_prefix, key, value
+                    )
+                )
+            dict_org[key] = value
+        elif isinstance(value, dict):
+            recursive_dict_update(
+                dict_org[key], value, verbose=verbose, log_prefix=f"{key}."
+            )
+        else:
+            if verbose and dict_org[key] != value:
+                logging.info(
+                    "Overwriting config: [{}{}]: {} -> {}".format(
+                        log_prefix, key, dict_org[key], value
+                    )
+                )
+            dict_org[key] = value
+
+
+def build_model_from_args_and_file(task, args, model_file, device):
+    model = task.build_model(args)
+    if not isinstance(model, AbsESPnetModel):
+        raise RuntimeError(
+            f"model must inherit {AbsESPnetModel.__name__}, but got {type(model)}"
+        )
+    model.to(device)
+    if model_file is not None:
+        if device == "cuda":
+            # NOTE(kamo): "cuda" for torch.load always indicates cuda:0
+            #   in PyTorch<=1.4
+            device = f"cuda:{torch.cuda.current_device()}"
+        model.load_state_dict(torch.load(model_file, map_location=device))
+    return model
 
 
 class SeparateSpeech:
@@ -41,10 +100,12 @@ class SeparateSpeech:
 
     """
 
+    @typechecked
     def __init__(
         self,
-        enh_train_config: Union[Path, str],
-        enh_model_file: Union[Path, str] = None,
+        train_config: Union[Path, str, None] = None,
+        model_file: Union[Path, str, None] = None,
+        inference_config: Union[Path, str, None] = None,
         segment_size: Optional[float] = None,
         hop_size: Optional[float] = None,
         normalize_segment_scale: bool = False,
@@ -53,14 +114,52 @@ class SeparateSpeech:
         normalize_output_wav: bool = False,
         device: str = "cpu",
         dtype: str = "float32",
+        enh_s2t_task: bool = False,
     ):
-        assert check_argument_types()
+
+        task = EnhancementTask if not enh_s2t_task else EnhS2TTask
 
         # 1. Build Enh model
-        enh_model, enh_train_args = EnhancementTask.build_model_from_file(
-            enh_train_config, enh_model_file, device
-        )
+
+        self.sfi_processing = False  # sampling-frequency-independent (SFI)
+        if inference_config is None:
+            enh_model, enh_train_args = task.build_model_from_file(
+                train_config, model_file, device
+            )
+        else:
+            # Overwrite model attributes
+            train_config = get_train_config(train_config, model_file=model_file)
+            with train_config.open("r", encoding="utf-8") as f:
+                train_args = yaml.safe_load(f)
+
+            with Path(inference_config).open("r", encoding="utf-8") as f:
+                infer_args = yaml.safe_load(f)
+
+            if enh_s2t_task:
+                arg_list = ("enh_encoder", "enh_separator", "enh_decoder")
+            else:
+                arg_list = ("encoder", "separator", "decoder")
+            supported_keys = list(chain(*[[k, k + "_conf"] for k in arg_list]))
+            for k in infer_args.keys():
+                if k not in supported_keys:
+                    raise ValueError(
+                        "Only the following top-level keys are supported: %s"
+                        % ", ".join(supported_keys)
+                    )
+
+            recursive_dict_update(train_args, infer_args, verbose=True)
+            enh_train_args = argparse.Namespace(**train_args)
+            enh_model = build_model_from_args_and_file(
+                task, enh_train_args, model_file, device
+            )
+
+        if enh_s2t_task:
+            enh_model = enh_model.enh_model
         enh_model.to(dtype=getattr(torch, dtype)).eval()
+        if isinstance(
+            enh_model.separator, ((BSRNNSeparator, USESSeparator, TFGridNetV3))
+        ):
+            self.sfi_processing = True
 
         self.device = device
         self.dtype = dtype
@@ -84,6 +183,8 @@ class SeparateSpeech:
                 "Overwrite enh_model.separator.ref_channel with {}".format(ref_channel)
             )
             enh_model.separator.ref_channel = ref_channel
+            if hasattr(enh_model.separator, "beamformer"):
+                enh_model.separator.beamformer.ref_channel = ref_channel
             self.ref_channel = ref_channel
         else:
             self.ref_channel = enh_model.ref_channel
@@ -100,9 +201,10 @@ class SeparateSpeech:
             logging.info("Perform direct speech %s on the input" % task)
 
     @torch.no_grad()
+    @typechecked
     def __call__(
-        self, speech_mix: Union[torch.Tensor, np.ndarray], fs: int = 8000
-    ) -> List[torch.Tensor]:
+        self, speech_mix: Union[torch.Tensor, np.ndarray], fs: int = 8000, **kwargs
+    ) -> List[Union[torch.Tensor, np.array]]:
         """Inference
 
         Args:
@@ -112,7 +214,6 @@ class SeparateSpeech:
             [separated_audio1, separated_audio2, ...]
 
         """
-        assert check_argument_types()
 
         # Input as audio signal
         if isinstance(speech_mix, np.ndarray):
@@ -121,14 +222,61 @@ class SeparateSpeech:
         assert speech_mix.dim() > 1, speech_mix.size()
         batch_size = speech_mix.size(0)
         speech_mix = speech_mix.to(getattr(torch, self.dtype))
-        # lenghts: (B,)
+        # lengths: (B,)
         lengths = speech_mix.new_full(
             [batch_size], dtype=torch.long, fill_value=speech_mix.size(1)
         )
 
+        lengths0 = lengths
+        if self.sfi_processing:
+            fs_ = fs
+        else:
+            fs_ = None
+            if self.enh_model.always_forward_in_48k:
+                lengths = lengths.new_tensor(
+                    [
+                        torchaudio.functional.resample(
+                            torch.randn(L, device="meta"), fs, 48000
+                        ).size(0)
+                        for L in lengths
+                    ]
+                )
+                speech_mix = torchaudio.functional.resample(speech_mix, fs, 48000)
+
         # a. To device
         speech_mix = to_device(speech_mix, device=self.device)
         lengths = to_device(lengths, device=self.device)
+
+        ###################################
+        # Normalize the signal variance
+        if getattr(self.enh_model, "normalize_variance_per_ch", False):
+            dim = 1
+            mix_std_ = torch.std(speech_mix, dim=dim, keepdim=True)
+            speech_mix = speech_mix / mix_std_  # RMS normalization
+        elif getattr(self.enh_model, "normalize_variance", False):
+            if speech_mix.ndim > 2:
+                dim = (1, 2)
+            else:
+                dim = 1
+            mix_std_ = torch.std(speech_mix, dim=dim, keepdim=True)
+            speech_mix = speech_mix / mix_std_  # RMS normalization
+
+        category = kwargs.get("utt2category", None)
+        if (
+            self.enh_model.categories
+            and category is not None
+            and category[0].item() not in self.enh_model.categories
+        ):
+            raise ValueError(f"Category '{category}' is not listed in self.categories")
+
+        additional = {}
+        if category is not None and self.enh_model.categories:
+            cat = self.enh_model.categories[category[0].item()]
+            print(f"category: {cat}", flush=True)
+            if cat.endswith("_reverb"):
+                additional["mode"] = "dereverb"
+            else:
+                additional["mode"] = "no_dereverb"
 
         if self.segmenting and lengths[0] > self.segment_size * fs:
             # Segment-wise speech enhancement/separation
@@ -157,10 +305,13 @@ class SeparateSpeech:
                     [batch_size], dtype=torch.long, fill_value=T
                 )
                 # b. Enhancement/Separation Forward
-                feats, f_lens = self.enh_model.encoder(speech_seg, lengths_seg)
-                feats, _, _ = self.enh_model.separator(feats, f_lens)
+                feats, f_lens = self.enh_model.encoder(speech_seg, lengths_seg, fs=fs_)
+                if isinstance(self.enh_model, ESPnetDiffusionModel):
+                    feats = [self.enh_model.enhance(feats)]
+                else:
+                    feats, _, _ = self.enh_model.separator(feats, f_lens, additional)
                 processed_wav = [
-                    self.enh_model.decoder(f, lengths_seg)[0] for f in feats
+                    self.enh_model.decoder(f, lengths_seg, fs=fs_)[0] for f in feats
                 ]
                 if speech_seg.dim() > 2:
                     # multi-channel speech
@@ -169,10 +320,17 @@ class SeparateSpeech:
                     speech_seg_ = speech_seg
 
                 if self.normalize_segment_scale:
-                    # normalize the energy of each separated stream
-                    # to match the input energy
+                    # normalize the scale to match the input mixture scale
+                    mix_energy = torch.sqrt(
+                        torch.mean(speech_seg_[:, :t].pow(2), dim=1, keepdim=True)
+                    )
+                    enh_energy = torch.sqrt(
+                        torch.mean(
+                            sum(processed_wav)[:, :t].pow(2), dim=1, keepdim=True
+                        )
+                    )
                     processed_wav = [
-                        self.normalize_scale(w, speech_seg_) for w in processed_wav
+                        w * (mix_energy / enh_energy) for w in processed_wav
                     ]
                 # List[torch.Tensor(num_spk, B, T)]
                 enh_waves.append(torch.stack(processed_wav, dim=0))
@@ -207,9 +365,29 @@ class SeparateSpeech:
             waves = torch.unbind(waves, dim=0)
         else:
             # b. Enhancement/Separation Forward
-            feats, f_lens = self.enh_model.encoder(speech_mix, lengths)
-            feats, _, _ = self.enh_model.separator(feats, f_lens)
-            waves = [self.enh_model.decoder(f, lengths)[0] for f in feats]
+            feats, f_lens = self.enh_model.encoder(speech_mix, lengths, fs=fs_)
+            if isinstance(self.enh_model, ESPnetDiffusionModel):
+                feats = [self.enh_model.enhance(feats)]
+            else:
+                feats, _, _ = self.enh_model.separator(feats, f_lens, additional)
+            waves = [self.enh_model.decoder(f, lengths, fs=fs_)[0] for f in feats]
+
+        ###################################
+        # De-normalize the signal variance
+        if getattr(self.enh_model, "normalize_variance_per_ch", False):
+            if mix_std_.ndim > 2:
+                mix_std_ = mix_std_[:, :, self.ref_channel]
+            waves = [w * mix_std_ for w in waves]
+        elif getattr(self.enh_model, "normalize_variance", False):
+            if mix_std_.ndim > 2:
+                mix_std_ = mix_std_.squeeze(2)
+            waves = [w * mix_std_ for w in waves]
+
+        if not self.sfi_processing and self.enh_model.always_forward_in_48k:
+            waves = [
+                torchaudio.functional.resample(sp, 48000, fs)[..., : lengths0.max()]
+                for sp in waves
+            ]
 
         assert len(waves) == self.num_spk, len(waves) == self.num_spk
         assert len(waves[0]) == batch_size, (len(waves[0]), batch_size)
@@ -223,21 +401,6 @@ class SeparateSpeech:
 
         return waves
 
-    @staticmethod
-    @torch.no_grad()
-    def normalize_scale(enh_wav, ref_ch_wav):
-        """Normalize the energy of enh_wav to match that of ref_ch_wav.
-
-        Args:
-            enh_wav (torch.Tensor): (B, Nsamples)
-            ref_ch_wav (torch.Tensor): (B, Nsamples)
-        Returns:
-            enh_wav (torch.Tensor): (B, Nsamples)
-        """
-        ref_energy = torch.sqrt(torch.mean(ref_ch_wav.pow(2), dim=1))
-        enh_energy = torch.sqrt(torch.mean(enh_wav.pow(2), dim=1))
-        return enh_wav * (ref_energy / enh_energy)[:, None]
-
     @torch.no_grad()
     def cal_permumation(self, ref_wavs, enh_wavs, criterion="si_snr"):
         """Calculate the permutation between seaprated streams in two adjacent segments.
@@ -249,17 +412,34 @@ class SeparateSpeech:
         Returns:
             perm (torch.Tensor): permutation for enh_wavs (Batch, num_spk)
         """
-        loss_func = {
-            "si_snr": self.enh_model.si_snr_loss,
-            "mse": lambda enh, ref: torch.mean((enh - ref).pow(2), dim=1),
-            "corr": lambda enh, ref: (
-                (enh * ref).sum(dim=1)
-                / (enh.pow(2).sum(dim=1) * ref.pow(2).sum(dim=1) + EPS)
-            ).clamp(min=EPS, max=1 - EPS),
-        }[criterion]
 
-        _, perm = self.enh_model._permutation_loss(ref_wavs, enh_wavs, loss_func)
+        criterion_class = {"si_snr": SISNRLoss, "mse": FrequencyDomainMSE}[criterion]
+
+        pit_solver = PITSolver(criterion=criterion_class())
+
+        _, _, others = pit_solver(ref_wavs, enh_wavs)
+        perm = others["perm"]
         return perm
+
+    @staticmethod
+    def from_pretrained(
+        model_tag: Optional[str] = None,
+        **kwargs: Optional[Any],
+    ):
+        """Build SeparateSpeech instance from the pretrained model.
+
+        Args:
+            model_tag (Optional[str]): Model tag of the pretrained models.
+                Currently, the tags of espnet_model_zoo are supported.
+
+        Returns:
+            SeparateSpeech: SeparateSpeech instance.
+
+        """
+        if model_tag is not None:
+            kwargs.update(download_pretrained(model_tag))
+
+        return SeparateSpeech(**kwargs)
 
 
 def humanfriendly_or_none(value: str):
@@ -268,6 +448,7 @@ def humanfriendly_or_none(value: str):
     return humanfriendly.parse_size(value)
 
 
+@typechecked
 def inference(
     output_dir: str,
     batch_size: int,
@@ -279,17 +460,20 @@ def inference(
     log_level: Union[int, str],
     data_path_and_name_and_type: Sequence[Tuple[str, str, str]],
     key_file: Optional[str],
-    enh_train_config: str,
-    enh_model_file: str,
+    train_config: Optional[str],
+    model_file: Optional[str],
+    model_tag: Optional[str],
+    inference_config: Optional[str],
     allow_variable_data_keys: bool,
     segment_size: Optional[float],
     hop_size: Optional[float],
     normalize_segment_scale: bool,
     show_progressbar: bool,
     ref_channel: Optional[int],
+    output_format: str,
     normalize_output_wav: bool,
+    enh_s2t_task: bool,
 ):
-    assert check_argument_types()
     if batch_size > 1:
         raise NotImplementedError("batch decoding is not implemented")
     if ngpu > 1:
@@ -309,9 +493,10 @@ def inference(
     set_all_random_seed(seed)
 
     # 2. Build separate_speech
-    separate_speech = SeparateSpeech(
-        enh_train_config=enh_train_config,
-        enh_model_file=enh_model_file,
+    separate_speech_kwargs = dict(
+        train_config=train_config,
+        model_file=model_file,
+        inference_config=inference_config,
         segment_size=segment_size,
         hop_size=hop_size,
         normalize_segment_scale=normalize_segment_scale,
@@ -320,6 +505,11 @@ def inference(
         normalize_output_wav=normalize_output_wav,
         device=device,
         dtype=dtype,
+        enh_s2t_task=enh_s2t_task,
+    )
+    separate_speech = SeparateSpeech.from_pretrained(
+        model_tag=model_tag,
+        **separate_speech_kwargs,
     )
 
     # 3. Build data-iterator
@@ -340,23 +530,39 @@ def inference(
     )
 
     # 4. Start for-loop
+    output_dir: Path = Path(output_dir).expanduser().resolve()
     writers = []
     for i in range(separate_speech.num_spk):
         writers.append(
-            SoundScpWriter(f"{output_dir}/wavs/{i + 1}", f"{output_dir}/spk{i + 1}.scp")
+            SoundScpWriter(
+                f"{output_dir}/wavs/{i + 1}",
+                f"{output_dir}/spk{i + 1}.scp",
+                format=output_format,
+            )
         )
 
-    for keys, batch in loader:
+    import tqdm
+
+    for i, (keys, batch) in tqdm.tqdm(enumerate(loader)):
+        logging.info(f"[{i}] Enhancing {keys}")
         assert isinstance(batch, dict), type(batch)
         assert all(isinstance(s, str) for s in keys), keys
         _bs = len(next(iter(batch.values())))
         assert len(keys) == _bs, f"{len(keys)} != {_bs}"
         batch = {k: v for k, v in batch.items() if not k.endswith("_lengths")}
 
-        waves = separate_speech(**batch)
-        for (spk, w) in enumerate(waves):
+        if "utt2fs" in batch:
+            # All samples must have the same sampling rate
+            assert all([fs_ == batch["utt2fs"][0].item() for fs_ in batch["utt2fs"]])
+            fs_ = batch.pop("utt2fs")[0].item()
+            logging.info(f"Swichting to fs={fs_}Hz")
+        else:
+            fs_ = fs
+
+        waves = separate_speech(**batch, fs=fs_)
+        for spk, w in enumerate(waves):
             for b in range(batch_size):
-                writers[spk][keys[b]] = fs, w[b]
+                writers[spk][keys[b]] = fs_, w[b]
 
     for writer in writers:
         writer.close()
@@ -414,6 +620,12 @@ def get_parser():
 
     group = parser.add_argument_group("Output data related")
     group.add_argument(
+        "--output_format",
+        type=str,
+        default="wav",
+        help="Output format for the separated speech",
+    )
+    group.add_argument(
         "--normalize_output_wav",
         type=str2bool,
         default=False,
@@ -421,8 +633,35 @@ def get_parser():
     )
 
     group = parser.add_argument_group("The model configuration related")
-    group.add_argument("--enh_train_config", type=str, required=True)
-    group.add_argument("--enh_model_file", type=str, required=True)
+    group.add_argument(
+        "--train_config",
+        type=str,
+        help="Training configuration file",
+    )
+    group.add_argument(
+        "--model_file",
+        type=str,
+        help="Model parameter file",
+    )
+    group.add_argument(
+        "--model_tag",
+        type=str,
+        help="Pretrained model tag. If specify this option, train_config and "
+        "model_file will be overwritten",
+    )
+    group.add_argument(
+        "--inference_config",
+        type=str_or_none,
+        default=None,
+        help="Optional configuration file for overwriting enh model attributes "
+        "during inference",
+    )
+    group.add_argument(
+        "--enh_s2t_task",
+        type=str2bool,
+        default=False,
+        help="enhancement and asr joint model",
+    )
 
     group = parser.add_argument_group("Data loading related")
     group.add_argument(
@@ -447,7 +686,7 @@ def get_parser():
     group.add_argument(
         "--normalize_segment_scale",
         type=str2bool,
-        default=False,
+        default=True,
         help="Whether to normalize the energy of the separated streams in each segment",
     )
     group.add_argument(

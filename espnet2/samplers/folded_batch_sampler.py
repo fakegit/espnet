@@ -1,17 +1,13 @@
-from typing import Iterator
-from typing import List
-from typing import Sequence
-from typing import Tuple
-from typing import Union
+from typing import Iterator, List, Optional, Sequence, Tuple, Union
 
-from typeguard import check_argument_types
+from typeguard import typechecked
 
-from espnet2.fileio.read_text import load_num_sequence_text
-from espnet2.fileio.read_text import read_2column_text
+from espnet2.fileio.read_text import load_num_sequence_text, read_2columns_text
 from espnet2.samplers.abs_sampler import AbsSampler
 
 
 class FoldedBatchSampler(AbsSampler):
+    @typechecked
     def __init__(
         self,
         batch_size: int,
@@ -21,9 +17,8 @@ class FoldedBatchSampler(AbsSampler):
         sort_in_batch: str = "descending",
         sort_batch: str = "ascending",
         drop_last: bool = False,
-        utt2category_file: str = None,
+        utt2category_file: Optional[str] = None,
     ):
-        assert check_argument_types()
         assert batch_size > 0
         if sort_batch != "ascending" and sort_batch != "descending":
             raise ValueError(
@@ -62,7 +57,7 @@ class FoldedBatchSampler(AbsSampler):
 
         category2utt = {}
         if utt2category_file is not None:
-            utt2category = read_2column_text(utt2category_file)
+            utt2category = read_2columns_text(utt2category_file)
             if set(utt2category) != set(first_utt2shape):
                 raise RuntimeError(
                     "keys are mismatched between "
@@ -85,7 +80,7 @@ class FoldedBatchSampler(AbsSampler):
                 bs = max(min_batch_size, int(batch_size / (1 + factor)))
                 if self.drop_last and start + bs > len(category_keys):
                     # This if-block avoids 0-batches
-                    if len(self.batch_list) > 0:
+                    if len(batch_sizes) > 0:
                         break
 
                 bs = min(len(category_keys) - start, bs)
@@ -102,7 +97,7 @@ class FoldedBatchSampler(AbsSampler):
             # the samples are redistributed to the other mini-batches
             if len(batch_sizes) > 1 and batch_sizes[-1] < min_batch_size:
                 for i in range(batch_sizes.pop(-1)):
-                    batch_sizes[-(i % len(batch_sizes)) - 2] += 1
+                    batch_sizes[-(i % len(batch_sizes)) - 1] += 1
 
             if not self.drop_last:
                 # Bug check

@@ -1,8 +1,10 @@
-import librosa
-import torch
+import math
 from typing import Tuple
 
-from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
+import librosa
+import torch
+
+from espnet2.legacy.nets.pytorch_backend.nets_utils import make_pad_mask
 
 
 class LogMel(torch.nn.Module):
@@ -69,7 +71,7 @@ class LogMel(torch.nn.Module):
         elif self.log_base == 10.0:
             logmel_feat = mel_feat.log10()
         else:
-            logmel_feat = mel_feat.log() / torch.log(self.log_base)
+            logmel_feat = mel_feat.log() / math.log(self.log_base)
 
         # Zero padding
         if ilens is not None:

@@ -1,31 +1,19 @@
-from collections import defaultdict
-from contextlib import contextmanager
+"""Reporter module."""
+
 import dataclasses
 import datetime
-from distutils.version import LooseVersion
 import logging
-from pathlib import Path
 import time
-from typing import ContextManager
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Sequence
-from typing import Tuple
-from typing import Union
 import warnings
+from collections import defaultdict
+from contextlib import contextmanager
+from pathlib import Path
+from typing import ContextManager, Dict, List, Optional, Sequence, Tuple, Union
 
 import humanfriendly
 import numpy as np
 import torch
-from typeguard import check_argument_types
-from typeguard import check_return_type
-import wandb
-
-if LooseVersion(torch.__version__) >= LooseVersion("1.1.0"):
-    from torch.utils.tensorboard import SummaryWriter
-else:
-    from tensorboardX import SummaryWriter
+from typeguard import typechecked
 
 Num = Union[float, int, complex, torch.Tensor, np.ndarray]
 
@@ -33,8 +21,8 @@ Num = Union[float, int, complex, torch.Tensor, np.ndarray]
 _reserved = {"time", "total_count"}
 
 
-def to_reported_value(v: Num, weight: Num = None) -> "ReportedValue":
-    assert check_argument_types()
+@typechecked
+def to_reported_value(v: Num, weight: Optional[Num] = None) -> "ReportedValue":
     if isinstance(v, (torch.Tensor, np.ndarray)):
         if np.prod(v.shape) != 1:
             raise ValueError(f"v must be 0 or 1 dimension: {len(v.shape)}")
@@ -49,12 +37,11 @@ def to_reported_value(v: Num, weight: Num = None) -> "ReportedValue":
         retval = WeightedAverage(v, weight)
     else:
         retval = Average(v)
-    assert check_return_type(retval)
     return retval
 
 
+@typechecked
 def aggregate(values: Sequence["ReportedValue"]) -> Num:
-    assert check_argument_types()
 
     for v in values:
         if not isinstance(v, type(values[0])):
@@ -93,8 +80,17 @@ def aggregate(values: Sequence["ReportedValue"]) -> Num:
 
     else:
         raise NotImplementedError(f"type={type(values[0])}")
-    assert check_return_type(retval)
     return retval
+
+
+def wandb_get_prefix(key: str):
+    if key.startswith("valid"):
+        return "valid/"
+    if key.startswith("train"):
+        return "train/"
+    if key.startswith("attn"):
+        return "attn/"
+    return "metrics/"
 
 
 class ReportedValue:
@@ -118,8 +114,8 @@ class SubReporter:
     See the docstring of Reporter for the usage.
     """
 
+    @typechecked
     def __init__(self, key: str, epoch: int, total_count: int):
-        assert check_argument_types()
         self.key = key
         self.epoch = epoch
         self.start_time = time.perf_counter()
@@ -152,12 +148,12 @@ class SubReporter:
 
         self._seen_keys_in_the_step = set()
 
+    @typechecked
     def register(
         self,
         stats: Dict[str, Optional[Union[Num, Dict[str, Num]]]],
-        weight: Num = None,
+        weight: Optional[Num] = None,
     ) -> None:
-        assert check_argument_types()
         if self._finished:
             raise RuntimeError("Already finished")
         if len(self._seen_keys_in_the_step) == 0:
@@ -220,7 +216,7 @@ class SubReporter:
                 message += f"{key2}={v:.3e}"
         return message
 
-    def tensorboard_add_scalar(self, summary_writer: SummaryWriter, start: int = None):
+    def tensorboard_add_scalar(self, summary_writer, start: int = None):
         if start is None:
             start = 0
         if start < 0:
@@ -231,9 +227,11 @@ class SubReporter:
             # values: List[ReportValue]
             values = stats_list[start:]
             v = aggregate(values)
-            summary_writer.add_scalar(key2, v, self.total_count)
+            summary_writer.add_scalar(f"{key2}", v, self.total_count)
 
-    def wandb_log(self, start: int = None, commit: bool = True):
+    def wandb_log(self, start: int = None):
+        import wandb
+
         if start is None:
             start = 0
         if start < 0:
@@ -245,9 +243,9 @@ class SubReporter:
             # values: List[ReportValue]
             values = stats_list[start:]
             v = aggregate(values)
-            d[key2] = v
+            d[wandb_get_prefix(key2) + key2] = v
         d["iteration"] = self.total_count
-        wandb.log(d, commit=commit)
+        wandb.log(d)
 
     def finished(self) -> None:
         self._finished = True
@@ -285,8 +283,8 @@ class Reporter:
 
     """
 
+    @typechecked
     def __init__(self, epoch: int = 0):
-        assert check_argument_types()
         if epoch < 0:
             raise ValueError(f"epoch must be 0 or more: {epoch}")
         self.epoch = epoch
@@ -349,14 +347,8 @@ class Reporter:
             seconds=time.perf_counter() - sub_reporter.start_time
         )
         stats["total_count"] = sub_reporter.total_count
-        if LooseVersion(torch.__version__) >= LooseVersion("1.4.0"):
-            if torch.cuda.is_initialized():
-                stats["gpu_max_cached_mem_GB"] = (
-                    torch.cuda.max_memory_reserved() / 2 ** 30
-                )
-        else:
-            if torch.cuda.is_available() and torch.cuda.max_memory_cached() > 0:
-                stats["gpu_cached_mem_GB"] = torch.cuda.max_memory_cached() / 2 ** 30
+        if torch.cuda.is_initialized():
+            stats["gpu_max_cached_mem_GB"] = torch.cuda.max_memory_reserved() / 2**30
 
         self.stats.setdefault(self.epoch, {})[sub_reporter.key] = stats
         sub_reporter.finished()
@@ -499,8 +491,8 @@ class Reporter:
             p.parent.mkdir(parents=True, exist_ok=True)
             plt.savefig(p)
 
+    @typechecked
     def _plot_stats(self, keys: Sequence[str], key2: str):
-        assert check_argument_types()
         # str is also Sequence[str]
         if isinstance(keys, str):
             raise TypeError(f"Input as [{keys}]")
@@ -516,18 +508,20 @@ class Reporter:
         epochs = np.arange(1, self.get_epoch() + 1)
         for key in keys:
             y = [
-                self.stats[e][key][key2]
-                if e in self.stats
-                and key in self.stats[e]
-                and key2 in self.stats[e][key]
-                else np.nan
+                (
+                    self.stats[e][key][key2]
+                    if e in self.stats
+                    and key in self.stats[e]
+                    and key2 in self.stats[e][key]
+                    else np.nan
+                )
                 for e in epochs
             ]
             assert len(epochs) == len(y), "Bug?"
 
             plt.plot(epochs, y, label=key, marker="x")
         plt.legend()
-        plt.title(f"epoch vs {key2}")
+        plt.title(f"{key2} vs epoch")
         # Force integer tick for x-axis
         plt.gca().get_xaxis().set_major_locator(ticker.MaxNLocator(integer=True))
         plt.xlabel("epoch")
@@ -536,21 +530,29 @@ class Reporter:
 
         return plt
 
-    def tensorboard_add_scalar(self, summary_writer: SummaryWriter, epoch: int = None):
+    def tensorboard_add_scalar(
+        self, summary_writer, epoch: int = None, key1: Optional[str] = None
+    ):
         if epoch is None:
             epoch = self.get_epoch()
+            total_count = self.stats[epoch]["train"]["total_count"]
+            if key1 == "train":
+                summary_writer.add_scalar("iter_epoch", epoch, total_count)
 
-        for key1 in self.get_keys(epoch):
-            for key2 in self.stats[epoch][key1]:
-                if key2 in ("time", "total_count"):
-                    continue
+        if key1 is not None:
+            key1_iterator = tuple([key1])
+        else:
+            key1_iterator = self.get_keys(epoch)
+
+        for key1 in key1_iterator:
+            for key2 in self.get_keys2(key1):
                 summary_writer.add_scalar(
-                    f"{key1}_{key2}_epoch",
-                    self.stats[epoch][key1][key2],
-                    epoch,
+                    f"{key2}", self.stats[epoch][key1][key2], total_count
                 )
 
-    def wandb_log(self, epoch: int = None, commit: bool = True):
+    def wandb_log(self, epoch: int = None):
+        import wandb
+
         if epoch is None:
             epoch = self.get_epoch()
 
@@ -559,13 +561,49 @@ class Reporter:
             for key2 in self.stats[epoch][key1]:
                 if key2 in ("time", "total_count"):
                     continue
-                d[f"{key1}_{key2}_epoch"] = self.stats[epoch][key1][key2]
+                key = f"{key1}_{key2}_epoch"
+                d[wandb_get_prefix(key) + key] = self.stats[epoch][key1][key2]
         d["epoch"] = epoch
-        wandb.log(d, commit=commit)
+        wandb.log(d)
 
     def state_dict(self):
-        return {"stats": self.stats, "epoch": self.epoch}
+        # Serialise stats into weights_only=True-safe native Python types.
+        # numpy scalars (e.g. np.float64 from np.nanmean) and
+        # datetime.timedelta are not allowed by torch.load weights_only=True,
+        # so we convert them here and restore in load_state_dict.
+        def _to_serialisable(v):
+            if isinstance(v, datetime.timedelta):
+                # Store as total seconds (float) so torch.save can pickle it
+                # with weights_only=True.  Restored to timedelta on load.
+                return {"__timedelta_seconds__": v.total_seconds()}
+            # Convert numpy scalars (np.float64, np.float32, …) to plain
+            # Python float.  In NumPy < 2.0 np.float64 is a subclass of
+            # Python float, so isinstance(v, float) would be True but v is
+            # still a numpy type and torch.load weights_only=True rejects it.
+            # We check for numpy scalars first to handle both NumPy versions.
+            if isinstance(v, np.generic):
+                return v.item()
+            return v
+
+        safe_stats = {}
+        for epoch, epoch_dict in self.stats.items():
+            safe_stats[epoch] = {}
+            for key, key_dict in epoch_dict.items():
+                safe_stats[epoch][key] = {
+                    k: _to_serialisable(val) for k, val in key_dict.items()
+                }
+        return {"stats": safe_stats, "epoch": self.epoch}
 
     def load_state_dict(self, state_dict: dict):
         self.epoch = state_dict["epoch"]
-        self.stats = state_dict["stats"]
+        # Restore datetime.timedelta objects that were serialised as dicts.
+        restored_stats = {}
+        for epoch, epoch_dict in state_dict["stats"].items():
+            restored_stats[epoch] = {}
+            for key, key_dict in epoch_dict.items():
+                restored_stats[epoch][key] = {}
+                for k, val in key_dict.items():
+                    if isinstance(val, dict) and "__timedelta_seconds__" in val:
+                        val = datetime.timedelta(seconds=val["__timedelta_seconds__"])
+                    restored_stats[epoch][key][k] = val
+        self.stats = restored_stats

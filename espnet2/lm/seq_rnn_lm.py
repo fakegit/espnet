@@ -1,10 +1,10 @@
 """Sequential implementation of Recurrent Neural Network Language Model."""
-from typing import Tuple
-from typing import Union
+
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from typeguard import check_argument_types
+from typeguard import typechecked
 
 from espnet2.lm.abs_model import AbsLM
 
@@ -17,18 +17,18 @@ class SequentialRNNLM(AbsLM):
 
     """
 
+    @typechecked
     def __init__(
         self,
         vocab_size: int,
         unit: int = 650,
-        nhid: int = None,
+        nhid: Optional[int] = None,
         nlayers: int = 2,
         dropout_rate: float = 0.0,
         tie_weights: bool = False,
         rnn_type: str = "lstm",
         ignore_id: int = 0,
     ):
-        assert check_argument_types()
         super().__init__()
 
         ninp = unit
@@ -47,10 +47,8 @@ class SequentialRNNLM(AbsLM):
             try:
                 nonlinearity = {"RNN_TANH": "tanh", "RNN_RELU": "relu"}[rnn_type]
             except KeyError:
-                raise ValueError(
-                    """An invalid option for `--model` was supplied,
-                    options are ['LSTM', 'GRU', 'RNN_TANH' or 'RNN_RELU']"""
-                )
+                raise ValueError("""An invalid option for `--model` was supplied,
+                    options are ['LSTM', 'GRU', 'RNN_TANH' or 'RNN_RELU']""")
             self.rnn = nn.RNN(
                 ninp,
                 nhid,
@@ -78,6 +76,17 @@ class SequentialRNNLM(AbsLM):
         self.rnn_type = rnn_type
         self.nhid = nhid
         self.nlayers = nlayers
+
+    def zero_state(self):
+        """Initialize LM state filled with zero values."""
+        if isinstance(self.rnn, torch.nn.LSTM):
+            h = torch.zeros((self.nlayers, self.nhid), dtype=torch.float)
+            c = torch.zeros((self.nlayers, self.nhid), dtype=torch.float)
+            state = h, c
+        else:
+            state = torch.zeros((self.nlayers, self.nhid), dtype=torch.float)
+
+        return state
 
     def forward(
         self, input: torch.Tensor, hidden: torch.Tensor

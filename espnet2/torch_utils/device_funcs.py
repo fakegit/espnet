@@ -1,4 +1,5 @@
 import dataclasses
+import gc
 import warnings
 
 import numpy as np
@@ -28,6 +29,18 @@ def to_device(data, device=None, dtype=None, non_blocking=False, copy=False):
     elif isinstance(data, np.ndarray):
         return to_device(torch.from_numpy(data), device, dtype, non_blocking, copy)
     elif isinstance(data, torch.Tensor):
+        if dtype is not None:
+            dtype = str(dtype).removeprefix("torch.")
+            cur_dtype = str(data.dtype).removeprefix("torch.")
+
+            if not (
+                ("int" in dtype and "int" in cur_dtype)
+                or ("float" in dtype and "float" in cur_dtype)
+            ):
+                dtype = None  # avoid conversion between int and float.
+            else:
+                dtype = getattr(torch, dtype)
+
         return data.to(device, dtype, non_blocking, copy)
     else:
         return data
@@ -69,3 +82,35 @@ def force_gatherable(data, device):
     else:
         warnings.warn(f"{type(data)} may not be gatherable by DataParallel")
         return data
+
+
+def is_out_of_memory_error(exc: BaseException) -> bool:
+    """Return whether ``exc``, or an exception it was raised from, is an OOM.
+
+    CUDA raises :class:`torch.OutOfMemoryError`; MPS raises a plain
+    :class:`RuntimeError` whose message starts with "MPS backend out of
+    memory". Both are covered, as is an OOM that a caller re-raised as another
+    exception with ``raise ... from exc``.
+    """
+    oom_cls = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+    seen = 0
+    while exc is not None and seen < 8:
+        if isinstance(exc, oom_cls):
+            return True
+        if isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower():
+            return True
+        exc = exc.__cause__
+        seen += 1
+    return False
+
+
+def release_accelerator_memory() -> None:
+    """Return cached accelerator memory to the device, after an OOM."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if (
+        getattr(torch.backends, "mps", None) is not None
+        and torch.backends.mps.is_available()
+    ):
+        torch.mps.empty_cache()

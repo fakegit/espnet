@@ -2,20 +2,20 @@
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
 """Encoder definition."""
+
 import contextlib
 import copy
-from filelock import FileLock
 import logging
 import os
-from typing import Optional
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
-from typeguard import check_argument_types
+from filelock import FileLock
+from typeguard import typechecked
 
-from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
-from espnet.nets.pytorch_backend.transformer.layer_norm import LayerNorm
 from espnet2.asr.encoder.abs_encoder import AbsEncoder
+from espnet2.legacy.nets.pytorch_backend.nets_utils import make_pad_mask
+from espnet2.legacy.nets.pytorch_backend.transformer.layer_norm import LayerNorm
 
 
 class FairSeqWav2Vec2Encoder(AbsEncoder):
@@ -31,6 +31,7 @@ class FairSeqWav2Vec2Encoder(AbsEncoder):
                                 0 means to finetune every layer if freeze_w2v=False.
     """
 
+    @typechecked
     def __init__(
         self,
         input_size: int,
@@ -40,7 +41,6 @@ class FairSeqWav2Vec2Encoder(AbsEncoder):
         normalize_before: bool = False,
         freeze_finetune_updates: int = 0,
     ):
-        assert check_argument_types()
         super().__init__()
 
         if w2v_url != "":
@@ -91,7 +91,7 @@ class FairSeqWav2Vec2Encoder(AbsEncoder):
             self.output_layer = None
 
         self.freeze_finetune_updates = freeze_finetune_updates
-        self.register_buffer("num_updates", torch.LongTensor([0]))
+        self.register_buffer("num_updates", torch.tensor([0], dtype=torch.long))
 
     def output_size(self) -> int:
         return self._output_size
@@ -124,13 +124,17 @@ class FairSeqWav2Vec2Encoder(AbsEncoder):
             enc_outputs = self.encoders(
                 xs_pad,
                 masks,
+                mask=self.training,
                 features_only=True,
             )
 
         xs_pad = enc_outputs["x"]  # (B,T,C),
-        masks = enc_outputs["padding_mask"]  # (B, T)
-
-        olens = (~masks).sum(dim=1)
+        bs = xs_pad.shape[0]
+        if enc_outputs["padding_mask"] is not None:
+            masks = enc_outputs["padding_mask"]  # (B, T)
+            olens = (~masks).sum(dim=1)  # (B)
+        else:
+            olens = torch.IntTensor([xs_pad.shape[1]]).repeat(bs).to(xs_pad.device)
 
         if self.output_layer is not None:
             xs_pad = self.output_layer(xs_pad)

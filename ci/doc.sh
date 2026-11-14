@@ -1,36 +1,154 @@
 #!/usr/bin/env bash
 
+set -euo pipefail
+
 . tools/activate_python.sh
+
+# ci/install.sh no longer installs the doc extra: only this script needs it,
+# and it was otherwise installed in every one of the ~100 CI jobs.
+python3 -m pip install -e ".[doc]"
+
+clean_outputs() {
+    rm -rf dist
+    rm -rf espnet2_bin
+    rm -rf utils_py
+
+    rm -rf doc/_gen
+    rm -rf doc/build
+    rm -rf doc/notebook
+
+    rm -rf doc/vuepress/src/*.md
+    rm -rf doc/vuepress/src/notebook
+    rm -rf doc/vuepress/src/*
+    rm -rf doc/vuepress/src/.vuepress/.temp
+    rm -rf doc/vuepress/src/.vuepress/.cache
+}
+
+build_and_convert () {
+    # $1: path
+    # $2: output
+    mkdir -p ./doc/_gen/tools/$2
+    for filename in $1; do
+        bn=$(basename ${filename})
+        echo "Converting ${filename} to rst..."
+        ./doc/usage2rst.sh ${filename} > ./doc/_gen/tools/$2/${bn}.rst
+    done
+}
 
 if [ ! -e tools/kaldi ]; then
     git clone https://github.com/kaldi-asr/kaldi --depth 1 tools/kaldi
 fi
 
+# clean previous build
+clean_outputs
+
 # build sphinx document under doc/
 mkdir -p doc/_gen
+mkdir -p doc/_gen/tools
+mkdir -p doc/_gen/guide
 
 # NOTE allow unbound variable (-u) inside kaldi scripts
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH-}
 set -euo pipefail
 # generate tools doc
-(
-    cd ./utils
-    ../doc/argparse2rst.py ./*.py > ../doc/_gen/utils_py.rst
-)
+echo "::group::generate tools doc"
+mkdir utils_py
+./doc/argparse2rst.py \
+    --title utils_py \
+    --output_dir utils_py \
+    ./utils/*.py
+mv utils_py ./doc/_gen/tools
+echo "::endgroup::"
 
-./doc/argparse2rst.py ./espnet/bin/*.py > ./doc/_gen/espnet_bin.rst
-# FIXME
-# ./doc/argparse2rst.py ./espnet2/bin/*.py > ./doc/_gen/espnet2_bin.rst
+echo "::group::generate espnet2_bin doc"
+mkdir espnet2_bin
+./doc/argparse2rst.py \
+    --title espnet2_bin \
+    --output_dir espnet2_bin \
+    ./espnet2/bin/*.py
+mv espnet2_bin ./doc/_gen/tools
+echo "::endgroup::"
 
+echo "::group::generate utils/tools doc"
+build_and_convert "utils/*.sh" utils
+build_and_convert "tools/sentencepiece_commands/spm_decode" spm
+build_and_convert "tools/sentencepiece_commands/spm_encode" spm
+# There seems no help prepared for spm_train command.
+echo "::endgroup::"
 
-find ./utils/{*.sh,spm_*} -exec ./doc/usage2rst.sh {} \; | tee ./doc/_gen/utils_sh.rst
-find ./espnet2/bin/*.py -exec ./doc/usage2rst.sh {} \; | tee ./doc/_gen/espnet2_bin.rst
+# incorporate espnet/notebook repository to docs
+echo "::group::incorporate notebook to docs"
+./doc/notebook2rst.sh
+echo "::endgroup::"
+
+# incorporate recipe template readme.md to docs
+echo "::group::incorporate recipe to docs"
+python ./doc/recipe2md.py --src ./egs2/TEMPLATE --dst ./doc/recipe
+echo "::endgroup::"
 
 # generate package doc
-./doc/module2rst.py --root espnet espnet2 --dst ./doc --exclude espnet.bin
+echo "::group::generate package doc"
+python ./doc/members2rst.py --root espnet2 --dst ./doc/_gen/guide --exclude espnet2.bin
+# The hand-written doc/espnet3 guides link to guide/espnet3/<module>/<Name>
+# API pages (BaseSystem, BaseRunner, InferenceProvider, ...) in ~40 places;
+# without this line nothing generates them and every one of those links 404s.
+python ./doc/members2rst.py --root espnet3 --dst ./doc/_gen/guide
+echo "::endgroup::"
 
-# build html
-travis-sphinx build --source=doc --nowarn
+# Two pages at one address make vuepress-plugin-search-pro throw
+# "SlimSearch: duplicate ID" after everything below has run, naming neither
+# page. Fail here instead, with both names.
+echo "::group::check page addresses"
+python3 ./ci/check_doc_pages.py
+echo "::endgroup::"
 
-touch doc/build/.nojekyll
+# build markdown
+echo "::group::build markdown"
+cp ./doc/index.rst ./doc/_gen/index.rst
+cp ./doc/conf.py ./doc/_gen/
+rm -f ./doc/_gen/tools/espnet2_bin/*_train.rst
+sphinx-build -M markdown ./doc/_gen ./doc/build
+echo "::endgroup::"
 
+# copy markdown files to specific directory.
+cp -r ./doc/build/markdown/* ./doc/vuepress/src/
+cp -r ./doc/notebook ./doc/vuepress/src/
+cp -r ./doc/recipe ./doc/vuepress/src
+cp ./doc/*.md ./doc/vuepress/src/
+mv ./doc/vuepress/src/README.md ./doc/vuepress/src/document.md
+cp -r ./doc/image ./doc/vuepress/src/
+cp -r ./doc/espnet3 ./doc/vuepress/src/espnet3
+
+# Document generation has finished.
+# From the following point we modify files for VuePress.
+# replace language tags which is not supported by VuePress
+# And convert custom tags to &lt; and &gt;, as <custom tag> can be recognized a html tag.
+python ./doc/convert_custom_tags_to_html.py ./doc/vuepress/src/guide
+python ./doc/convert_custom_tags_to_html.py ./doc/vuepress/src/tools
+python ./doc/convert_custom_tags_to_html.py ./doc/vuepress/src/recipe
+# doc/espnet3 is hand-written (it uses real <DocCard>/<Foo /> Vue
+# components), so it needs the permissive, author-escape-aware path --
+# convert_custom_tags_to_html.py picks that automatically because the
+# path contains "espnet3" (see is_handwritten_path()). It must NOT go
+# through convert_md_to_homepage.py below: that rewrites every ### / ####
+# heading into a non-semantic <div class='custom-h3'/'custom-h4'>, which
+# is correct for sphinx-generated API signature pages but would strip
+# real section headings (TOC/sidebar anchors) from these hand-written
+# guides.
+python ./doc/convert_custom_tags_to_html.py ./doc/vuepress/src/espnet3
+
+# Convert API document to specific html tags to display sphinx style
+python ./doc/convert_md_to_homepage.py ./doc/vuepress/src/guide/
+python ./doc/convert_md_to_homepage.py ./doc/vuepress/src/tools/
+python ./doc/convert_md_to_homepage.py ./doc/vuepress/src/recipe
+
+# Create navbar and sidebar.
+cd ./doc/vuepress
+python create_menu.py --root ./src
+
+npm ci
+# npm run docs:dev
+npm run docs:build
+mv src/.vuepress/dist ../../
+
+touch ../../dist/.nojekyll

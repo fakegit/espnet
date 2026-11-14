@@ -1,22 +1,25 @@
 import collections.abc
+import re
 from pathlib import Path
-from typing import Dict
-from typing import List
-from typing import Tuple
-from typing import Union
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
-import re
-from typeguard import check_argument_types
+from typeguard import typechecked
 
 
-def load_rttm_text(path: Union[Path, str]) -> Dict[str, List[Tuple[str, float, float]]]:
+@typechecked
+def load_rttm_text(
+    path: Union[Path, str],
+) -> Dict[str, Tuple[List[str], List[Tuple[str, int, int]], int]]:
     """Read a RTTM file
 
     Note: only support speaker information now
+
+    Returns:
+        A dict mapping each utterance ID to (speaker IDs,
+        [(speaker ID, start, end), ...], length given by its END line).
     """
 
-    assert check_argument_types()
     data = {}
     with Path(path).open("r", encoding="utf-8") as f:
         for linenum, line in enumerate(f, 1):
@@ -52,7 +55,7 @@ class RttmReader(collections.abc.Mapping):
         SPEAKER file1 1 0 1023 <NA> <NA> spk1 <NA>
         SPEAKER file1 2 4000 3023 <NA> <NA> spk2 <NA>
         SPEAKER file1 3 500 4023 <NA> <NA> spk1 <NA>
-        END     file1 <NA> 4023 <NA> <NA> <NA> <NA>
+        END     file1 <NA> <NA> 4023 <NA> <NA> <NA> <NA>
 
         This is an extend version of standard RTTM format for espnet.
         The difference including:
@@ -68,11 +71,11 @@ class RttmReader(collections.abc.Mapping):
 
     """
 
+    @typechecked
     def __init__(
         self,
         fname: str,
     ):
-        assert check_argument_types()
         super().__init__()
 
         self.fname = fname
@@ -85,8 +88,26 @@ class RttmReader(collections.abc.Mapping):
             spk_label[start : end + 1, spk_list.index(spk_id)] = 1
         return spk_label
 
+    def read_span(self, key: str, start: int, end: int) -> np.ndarray:
+        """Return the label of samples `start`..`end` - 1 of `key`.
+
+        The same as ``self[key][start:end]``: one column per speaker of the
+        whole recording, also for speakers who do not speak in the span.
+        """
+        spk_list, spk_event, max_duration = self.data[key]
+        if not 0 <= start < end <= max_duration:
+            raise ValueError(
+                f"samples {start}-{end} out of the {max_duration} of {key}"
+            )
+        spk_label = np.zeros((end - start, len(spk_list)))
+        for spk_id, s, e in spk_event:
+            s, e = max(s, start), min(e + 1, end)
+            if s < e:
+                spk_label[s - start : e - start, spk_list.index(spk_id)] = 1
+        return spk_label
+
     def __contains__(self, item):
-        return item
+        return item in self.data
 
     def __len__(self):
         return len(self.data)

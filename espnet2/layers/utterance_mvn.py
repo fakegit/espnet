@@ -1,20 +1,20 @@
 from typing import Tuple
 
 import torch
-from typeguard import check_argument_types
+from typeguard import typechecked
 
-from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
 from espnet2.layers.abs_normalize import AbsNormalize
+from espnet2.legacy.nets.pytorch_backend.nets_utils import make_pad_mask
 
 
 class UtteranceMVN(AbsNormalize):
+    @typechecked
     def __init__(
         self,
         norm_means: bool = True,
         norm_vars: bool = False,
         eps: float = 1.0e-20,
     ):
-        assert check_argument_types()
         super().__init__()
         self.norm_means = norm_means
         self.norm_vars = norm_vars
@@ -72,17 +72,28 @@ def utterance_mvn(
 
     if norm_means:
         x -= mean
+        # mean is broadcast over the padded frames too, so restore the zero padding
+        # before it reaches the variance below or the caller.
+        if x.requires_grad:
+            x = x.masked_fill(make_pad_mask(ilens, x, 1), 0.0)
+        else:
+            x.masked_fill_(make_pad_mask(ilens, x, 1), 0.0)
 
         if norm_vars:
             var = x.pow(2).sum(dim=1, keepdim=True) / ilens_
-            std = torch.clamp(var.sqrt(), min=eps)
-            x = x / std.sqrt()
+            # Avoid sqrt's undefined gradient at zero before applying the floor.
+            zero_var = var == 0
+            std = var.masked_fill(zero_var, 1.0).sqrt()
+            std = torch.clamp(std.masked_fill(zero_var, 0.0), min=eps)
+            x = x / std
         return x, ilens
     else:
         if norm_vars:
             y = x - mean
             y.masked_fill_(make_pad_mask(ilens, y, 1), 0.0)
             var = y.pow(2).sum(dim=1, keepdim=True) / ilens_
-            std = torch.clamp(var.sqrt(), min=eps)
+            zero_var = var == 0
+            std = var.masked_fill(zero_var, 1.0).sqrt()
+            std = torch.clamp(std.masked_fill(zero_var, 0.0), min=eps)
             x /= std
         return x, ilens

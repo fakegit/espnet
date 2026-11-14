@@ -1,28 +1,26 @@
-from distutils.version import LooseVersion
-from typing import Optional
-from typing import Tuple
-from typing import Union
+from typing import Optional, Tuple, Union
 
 import torch
 from torch_complex.tensor import ComplexTensor
-from typeguard import check_argument_types
+from typeguard import typechecked
 
-from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
+from espnet2.enh.layers.complex_utils import to_complex
 from espnet2.layers.inversible_interface import InversibleInterface
+from espnet2.legacy.nets.pytorch_backend.nets_utils import make_pad_mask
 
 
 class Stft(torch.nn.Module, InversibleInterface):
+    @typechecked
     def __init__(
         self,
         n_fft: int = 512,
-        win_length: int = None,
+        win_length: Optional[int] = None,
         hop_length: int = 128,
         window: Optional[str] = "hann",
         center: bool = True,
         normalized: bool = False,
         onesided: bool = True,
     ):
-        assert check_argument_types()
         super().__init__()
         self.n_fft = n_fft
         if win_length is None:
@@ -81,8 +79,8 @@ class Stft(torch.nn.Module, InversibleInterface):
             )
         else:
             window = None
-        output = torch.stft(
-            input,
+
+        stft_kwargs = dict(
             n_fft=self.n_fft,
             win_length=self.win_length,
             hop_length=self.hop_length,
@@ -91,6 +89,11 @@ class Stft(torch.nn.Module, InversibleInterface):
             normalized=self.normalized,
             onesided=self.onesided,
         )
+        stft_kwargs["return_complex"] = True
+        # NOTE(Jinchuan) CuFFT is not compatible with bfloat16
+        output = torch.stft(input.float(), **stft_kwargs)
+        output = torch.view_as_real(output).type(input.dtype)
+
         # output: (Batch, Freq, Frames, 2=real_imag)
         # -> (Batch, Frames, Freq, 2=real_imag)
         output = output.transpose(1, 2)
@@ -103,10 +106,13 @@ class Stft(torch.nn.Module, InversibleInterface):
 
         if ilens is not None:
             if self.center:
-                pad = self.win_length // 2
+                pad = self.n_fft // 2
                 ilens = ilens + 2 * pad
 
-            olens = (ilens - self.win_length) // self.hop_length + 1
+            olens = (
+                torch.div(ilens - self.n_fft, self.hop_length, rounding_mode="trunc")
+                + 1
+            )
             output.masked_fill_(make_pad_mask(olens, output, 1), 0.0)
         else:
             olens = None
@@ -125,36 +131,18 @@ class Stft(torch.nn.Module, InversibleInterface):
             wavs: (batch, samples)
             ilens: (batch,)
         """
-        if LooseVersion(torch.__version__) >= LooseVersion("1.6.0"):
-            istft = torch.functional.istft
-        else:
-            try:
-                import torchaudio
-            except ImportError:
-                raise ImportError(
-                    "Please install torchaudio>=0.3.0 or use torch>=1.6.0"
-                )
-
-            if not hasattr(torchaudio.functional, "istft"):
-                raise ImportError(
-                    "Please install torchaudio>=0.3.0 or use torch>=1.6.0"
-                )
-            istft = torchaudio.functional.istft
+        input = to_complex(input)
 
         if self.window is not None:
             window_func = getattr(torch, f"{self.window}_window")
-            window = window_func(
-                self.win_length, dtype=input.dtype, device=input.device
-            )
+            datatype = input.real.dtype
+            window = window_func(self.win_length, dtype=datatype, device=input.device)
         else:
             window = None
 
-        if isinstance(input, ComplexTensor):
-            input = torch.stack([input.real, input.imag], dim=-1)
-        assert input.shape[-1] == 2
         input = input.transpose(1, 2)
 
-        wavs = istft(
+        wavs = torch.functional.istft(
             input,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
@@ -164,6 +152,7 @@ class Stft(torch.nn.Module, InversibleInterface):
             normalized=self.normalized,
             onesided=self.onesided,
             length=ilens.max() if ilens is not None else ilens,
+            return_complex=False,
         )
 
         return wavs, ilens

@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 import argparse
-from collections import Counter
 import logging
-from pathlib import Path
 import sys
-from typing import List
-from typing import Optional
+from collections import Counter
+from pathlib import Path
+from typing import List, Optional
 
-from typeguard import check_argument_types
+from typeguard import typechecked
 
-from espnet.utils.cli_utils import get_commandline_args
+from espnet2.legacy.utils.cli_utils import get_commandline_args
 from espnet2.text.build_tokenizer import build_tokenizer
 from espnet2.text.cleaner import TextCleaner
-from espnet2.utils.types import str2bool
-from espnet2.utils.types import str_or_none
+from espnet2.text.phoneme_tokenizer import g2p_choices
+from espnet2.utils.types import str2bool, str_or_none
 
 
 def field2slice(field: Optional[str]) -> slice:
-    """Convert field string to slice
+    """Convert field string to slice.
 
     Note that field string accepts 1-based integer.
-
     Examples:
         >>> field2slice("1-")
         slice(0, None, None)
@@ -28,7 +26,6 @@ def field2slice(field: Optional[str]) -> slice:
         slice(0, 3, None)
         >>> field2slice("-3")
         slice(None, 3, None)
-
     """
     field = field.strip()
     try:
@@ -54,12 +51,16 @@ def field2slice(field: Optional[str]) -> slice:
     except ValueError:
         raise RuntimeError(f"Format error: e.g. '2-', '2-5', or '-5': {field}")
 
-    # -1 because of 1-based integer following "cut" command
-    # e.g "1-3" -> slice(0, 3)
-    slic = slice(s1 - 1, s2)
+    if s1 is None:
+        slic = slice(None, s2)
+    else:
+        # -1 because of 1-based integer following "cut" command
+        # e.g "1-3" -> slice(0, 3)
+        slic = slice(s1 - 1, s2)
     return slic
 
 
+@typechecked
 def tokenize(
     input: str,
     output: str,
@@ -77,8 +78,8 @@ def tokenize(
     add_symbol: List[str],
     cleaner: Optional[str],
     g2p: Optional[str],
+    add_nonsplit_symbol: List[str],
 ):
-    assert check_argument_types()
 
     logging.basicConfig(
         level=log_level,
@@ -95,7 +96,7 @@ def tokenize(
         p.parent.mkdir(parents=True, exist_ok=True)
         fout = p.open("w", encoding="utf-8")
 
-    cleaner = TextCleaner(cleaner)
+    cleaner: TextCleaner = TextCleaner(cleaner)
     tokenizer = build_tokenizer(
         token_type=token_type,
         bpemodel=bpemodel,
@@ -104,11 +105,12 @@ def tokenize(
         non_linguistic_symbols=non_linguistic_symbols,
         remove_non_linguistic_symbols=remove_non_linguistic_symbols,
         g2p_type=g2p,
+        nonsplit_symbol=add_nonsplit_symbol,
     )
 
     counter = Counter()
     if field is not None:
-        field = field2slice(field)
+        field: slice = field2slice(field)
 
     for line in fin:
         line = line.rstrip()
@@ -145,8 +147,8 @@ def tokenize(
             raise RuntimeError(f"vocabulary_size is too small: {vocabulary_size}")
         words_and_counts = words_and_counts[: vocabulary_size - len(add_symbol)]
 
-    # Parse the values of --add_symbol
-    for symbol_and_id in add_symbol:
+    # Parse the values of --add_symbol and --add_nonsplit_symbol
+    for symbol_and_id in add_symbol + add_nonsplit_symbol:
         # e.g symbol="<blank>:0"
         try:
             symbol, idx = symbol_and_id.split(":")
@@ -219,25 +221,22 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cleaner",
         type=str_or_none,
-        choices=[None, "tacotron", "jaconv", "vietnamese"],
+        choices=[
+            None,
+            "tacotron",
+            "jaconv",
+            "vietnamese",
+            "korean_cleaner",
+            "whisper_en",
+            "whisper_basic",
+        ],
         default=None,
         help="Apply text cleaning",
     )
     parser.add_argument(
         "--g2p",
         type=str_or_none,
-        choices=[
-            None,
-            "g2p_en",
-            "g2p_en_no_space",
-            "pyopenjtalk",
-            "pyopenjtalk_kana",
-            "pyopenjtalk_accent",
-            "pyopenjtalk_accent_with_pause",
-            "pypinyin_g2p",
-            "pypinyin_g2p_phone",
-            "espeak_ng_arabic",
-        ],
+        choices=g2p_choices,
         default=None,
         help="Specify g2p method if --token_type=phn",
     )
@@ -262,6 +261,13 @@ def get_parser() -> argparse.ArgumentParser:
         default=[],
         action="append",
         help="Append symbol e.g. --add_symbol '<blank>:0' --add_symbol '<unk>:1'",
+    )
+    group.add_argument(
+        "--add_nonsplit_symbol",
+        type=str,
+        default=[],
+        action="append",
+        help="Append symbol that is nonsplit e.g. --add_nonsplit_symbol '<sc>:2",
     )
 
     return parser

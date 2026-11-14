@@ -3,13 +3,13 @@
 
 """Style encoder of GST-Tacotron."""
 
-from typeguard import check_argument_types
 from typing import Sequence
 
 import torch
+from typeguard import typechecked
 
-from espnet.nets.pytorch_backend.transformer.attention import (
-    MultiHeadedAttention as BaseMultiHeadedAttention,  # NOQA
+from espnet2.legacy.nets.pytorch_backend.transformer.attention import (
+    MultiHeadedAttention as BaseMultiHeadedAttention,
 )
 
 
@@ -31,17 +31,20 @@ class StyleEncoder(torch.nn.Module):
         conv_chans_list: (Sequence[int], optional):
             List of the number of channels of conv layers in the referece encoder.
         conv_kernel_size (int, optional):
-            Kernal size of conv layers in the reference encoder.
+            Kernel size of conv layers in the reference encoder.
         conv_stride (int, optional):
             Stride size of conv layers in the reference encoder.
         gru_layers (int, optional): The number of GRU layers in the reference encoder.
         gru_units (int, optional): The number of GRU units in the reference encoder.
+        use_sdpa (bool, optional): Use PyTorch's scaled dot product attention in
+            the style token layer.
 
     Todo:
         * Support manual weight specification in inference.
 
     """
 
+    @typechecked
     def __init__(
         self,
         idim: int = 80,
@@ -54,9 +57,9 @@ class StyleEncoder(torch.nn.Module):
         conv_stride: int = 2,
         gru_layers: int = 1,
         gru_units: int = 128,
+        use_sdpa: bool = False,
     ):
         """Initilize global style encoder module."""
-        assert check_argument_types()
         super(StyleEncoder, self).__init__()
 
         self.ref_enc = ReferenceEncoder(
@@ -73,6 +76,7 @@ class StyleEncoder(torch.nn.Module):
             gst_tokens=gst_tokens,
             gst_token_dim=gst_token_dim,
             gst_heads=gst_heads,
+            use_sdpa=use_sdpa,
         )
 
     def forward(self, speech: torch.Tensor) -> torch.Tensor:
@@ -94,7 +98,7 @@ class StyleEncoder(torch.nn.Module):
 class ReferenceEncoder(torch.nn.Module):
     """Reference encoder module.
 
-    This module is refernece encoder introduced in `Style Tokens: Unsupervised Style
+    This module is reference encoder introduced in `Style Tokens: Unsupervised Style
     Modeling, Control and Transfer in End-to-End Speech Synthesis`.
 
     .. _`Style Tokens: Unsupervised Style Modeling, Control and Transfer in End-to-End
@@ -106,7 +110,7 @@ class ReferenceEncoder(torch.nn.Module):
         conv_chans_list: (Sequence[int], optional):
             List of the number of channels of conv layers in the referece encoder.
         conv_kernel_size (int, optional):
-            Kernal size of conv layers in the reference encoder.
+            Kernel size of conv layers in the reference encoder.
         conv_stride (int, optional):
             Stride size of conv layers in the reference encoder.
         gru_layers (int, optional): The number of GRU layers in the reference encoder.
@@ -114,6 +118,7 @@ class ReferenceEncoder(torch.nn.Module):
 
     """
 
+    @typechecked
     def __init__(
         self,
         idim=80,
@@ -125,7 +130,6 @@ class ReferenceEncoder(torch.nn.Module):
         gru_units: int = 128,
     ):
         """Initilize reference encoder module."""
-        assert check_argument_types()
         super(ReferenceEncoder, self).__init__()
 
         # check hyperparameters are valid
@@ -206,9 +210,11 @@ class StyleTokenLayer(torch.nn.Module):
         gst_token_dim (int, optional): Dimension of each GST embedding.
         gst_heads (int, optional): The number of heads in GST multihead attention.
         dropout_rate (float, optional): Dropout rate in multi-head attention.
+        use_sdpa (bool, optional): Use PyTorch's scaled dot product attention.
 
     """
 
+    @typechecked
     def __init__(
         self,
         ref_embed_dim: int = 128,
@@ -216,9 +222,9 @@ class StyleTokenLayer(torch.nn.Module):
         gst_token_dim: int = 256,
         gst_heads: int = 4,
         dropout_rate: float = 0.0,
+        use_sdpa: bool = False,
     ):
         """Initilize style token layer module."""
-        assert check_argument_types()
         super(StyleTokenLayer, self).__init__()
 
         gst_embs = torch.randn(gst_tokens, gst_token_dim // gst_heads)
@@ -230,6 +236,7 @@ class StyleTokenLayer(torch.nn.Module):
             n_head=gst_heads,
             n_feat=gst_token_dim,
             dropout_rate=dropout_rate,
+            use_sdpa=use_sdpa,
         )
 
     def forward(self, ref_embs: torch.Tensor) -> torch.Tensor:
@@ -255,7 +262,9 @@ class StyleTokenLayer(torch.nn.Module):
 class MultiHeadedAttention(BaseMultiHeadedAttention):
     """Multi head attention module with different input dimension."""
 
-    def __init__(self, q_dim, k_dim, v_dim, n_head, n_feat, dropout_rate=0.0):
+    def __init__(
+        self, q_dim, k_dim, v_dim, n_head, n_feat, dropout_rate=0.0, use_sdpa=False
+    ):
         """Initialize multi head attention module."""
         # NOTE(kan-bayashi): Do not use super().__init__() here since we want to
         #   overwrite BaseMultiHeadedAttention.__init__() method.
@@ -270,3 +279,9 @@ class MultiHeadedAttention(BaseMultiHeadedAttention):
         self.linear_out = torch.nn.Linear(n_feat, n_feat)
         self.attn = None
         self.dropout = torch.nn.Dropout(p=dropout_rate)
+        # The SDPA path in the base class reads the rate from this attribute.
+        self.dropout_rate = dropout_rate
+        self.use_flash_attn = False
+        self.use_sdpa = use_sdpa
+        self.q_norm = torch.nn.Identity()
+        self.k_norm = torch.nn.Identity()

@@ -1,19 +1,19 @@
 import logging
-from typing import Any
-from typing import Dict
-from typing import Iterator
-from typing import List
-from typing import Sequence
-from typing import Tuple
-from typing import Union
+import re
+from collections import defaultdict
+from copy import deepcopy
+from math import inf
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-from typeguard import check_argument_types
+from typeguard import typechecked
 
 from espnet2.iterators.abs_iter_factory import AbsIterFactory
 from espnet2.iterators.sequence_iter_factory import SequenceIterFactory
 from espnet2.samplers.abs_sampler import AbsSampler
+
+DEFAULT_EXCLUDED_KEY_PREFIXES = ("utt2category", "utt2fs")
 
 
 class ChunkIterFactory(AbsIterFactory):
@@ -36,6 +36,7 @@ class ChunkIterFactory(AbsIterFactory):
 
     """
 
+    @typechecked
     def __init__(
         self,
         dataset,
@@ -44,15 +45,35 @@ class ChunkIterFactory(AbsIterFactory):
         chunk_length: Union[int, str],
         chunk_shift_ratio: float = 0.5,
         num_cache_chunks: int = 1024,
-        num_samples_per_epoch: int = None,
+        num_samples_per_epoch: Optional[int] = None,
         seed: int = 0,
         shuffle: bool = False,
         num_workers: int = 0,
         collate_fn=None,
         pin_memory: bool = False,
+        excluded_key_prefixes: Optional[List[str]] = None,
+        discard_short_samples: bool = True,
+        default_fs: Optional[int] = None,
+        chunk_max_abs_length: Optional[int] = None,
+        left_context: int = 0,
+        left_context_keys: Sequence[str] = ("speech",),
     ):
-        assert check_argument_types()
+        """Initialize.
+
+        left_context: Number of samples (at ``default_fs`` if given) that the
+            chunks of ``left_context_keys`` get in front of the chunk: the
+            chunk [a, a + W) of such a key becomes [a - left_context, a + W),
+            with zeros before the start of the sequence; the other keys (e.g.
+            the labels) keep [a, a + W). For a model that uses the samples
+            before the chunk as history and then removes them, such as the
+            reverberation of BatchWavAugment(context=...). 0 for none.
+        left_context_keys: Keys whose chunks get the left context.
+        """
         assert all(len(x) == 1 for x in batches), "batch-size must be 1"
+        if left_context < 0:
+            raise ValueError(f"left_context must be >= 0: {left_context}")
+        self.left_context = int(left_context)
+        self.left_context_keys = set(left_context_keys)
 
         self.per_sample_iter_factory = SequenceIterFactory(
             dataset=dataset,
@@ -88,15 +109,64 @@ class ChunkIterFactory(AbsIterFactory):
             # Single candidates: Fixed chunk length
             self.chunk_lengths = [chunk_length]
 
+        if chunk_max_abs_length is None:
+            self.chunk_max_abs_length = inf
+        else:
+            self.chunk_max_abs_length = chunk_max_abs_length
         self.chunk_shift_ratio = chunk_shift_ratio
         self.batch_size = batch_size
         self.seed = seed
         self.shuffle = shuffle
+        # Default sampling frequency used to decide the chunk length
+        # in case that different batches have different sampling frequencies
+        # (If None, the chunk length is always fixed)
+        self.default_fs = default_fs
+        # Whether to discard samples that shorter than the shortest chunk length
+        self.discard_short_samples = discard_short_samples
+        self.collate_fn = collate_fn
+
+        # keys that satisfy either condition below will be excluded from the length
+        # consistency check:
+        #  - exactly match one of the prefixes in `excluded_key_prefixes`
+        #  - have one of the prefixes in `excluded_key_prefixes` and end with numbers
+        if excluded_key_prefixes is None:
+            _excluded_key_prefixes = DEFAULT_EXCLUDED_KEY_PREFIXES
+        else:
+            _excluded_key_prefixes = deepcopy(excluded_key_prefixes)
+            for k in DEFAULT_EXCLUDED_KEY_PREFIXES:
+                if k not in _excluded_key_prefixes:
+                    _excluded_key_prefixes.append(k)
+        self.excluded_key_pattern = (
+            "(" + "[0-9]*)|(".join(_excluded_key_prefixes) + "[0-9]*)"
+        )
+        if self.excluded_key_pattern:
+            logging.info(
+                f"Data keys with the following patterns will be excluded from the "
+                f"length consistency check:\n{self.excluded_key_pattern}"
+            )
+
+    @staticmethod
+    def _with_left_context(v, start: int, width: int, context: int):
+        """Return v[start - context : start + width], zero-padded on the left.
+
+        The samples before the start of the sequence are zeros, so the result
+        always has context + width samples along the first axis.
+        """
+        chunk = v[max(start - context, 0) : start + width]
+        missing = context - start
+        if missing > 0:
+            if isinstance(chunk, torch.Tensor):
+                pad = chunk.new_zeros((missing,) + tuple(chunk.shape[1:]))
+                chunk = torch.cat([pad, chunk], 0)
+            else:
+                pad = np.zeros((missing,) + chunk.shape[1:], dtype=chunk.dtype)
+                chunk = np.concatenate([pad, chunk], 0)
+        return chunk
 
     def build_iter(
         self,
         epoch: int,
-        shuffle: bool = None,
+        shuffle: Optional[bool] = None,
     ) -> Iterator[Tuple[List[str], Dict[str, torch.Tensor]]]:
         per_sample_loader = self.per_sample_iter_factory.build_iter(epoch, shuffle)
 
@@ -106,9 +176,9 @@ class ChunkIterFactory(AbsIterFactory):
 
         # NOTE(kamo):
         #   This iterator supports multiple chunk lengths and
-        #   keep chunks for each lenghts here until collecting specified numbers
-        cache_chunks_dict = {}
-        cache_id_list_dict = {}
+        #   keep chunks for each lengths here until collecting specified numbers
+        cache_chunks_dict = defaultdict(dict)
+        cache_id_list_dict = defaultdict(dict)
         for ids, batch in per_sample_loader:
             # Must be per-sample-loader
             assert len(ids) == 1, f"Must be per-sample-loader: {len(ids)}"
@@ -124,34 +194,65 @@ class ChunkIterFactory(AbsIterFactory):
             id_ = ids[0]
 
             for key in sequence_keys:
+                if self.excluded_key_pattern is not None and re.fullmatch(
+                    self.excluded_key_pattern, key
+                ):
+                    # ignore length inconsistency for `excluded_key_prefixes`
+                    continue
                 if len(batch[key]) != len(batch[sequence_keys[0]]):
                     raise RuntimeError(
                         f"All sequences must has same length: "
                         f"{len(batch[key])} != {len(batch[sequence_keys[0]])}"
                     )
 
+            # Get sampling frequency of the batch to recalculate the chunk length
+            fs = (
+                batch.get("utt2fs", torch.tensor([16000], dtype=torch.long))
+                .type(torch.int64)
+                .item()
+            )
+            default_fs = fs if self.default_fs is None else self.default_fs
+            assert fs % default_fs == 0 or default_fs % fs == 0
+
             L = len(batch[sequence_keys[0]])
             # Select chunk length
-            chunk_lengths = [lg for lg in self.chunk_lengths if lg < L]
-            if len(chunk_lengths) == 0:
+            chunk_lengths = [lg * fs // default_fs for lg in self.chunk_lengths]
+            chunk_lengths = [
+                min(lg, self.chunk_max_abs_length) for lg in chunk_lengths if lg < L
+            ]
+            if len(chunk_lengths) == 0 and getattr(self, "discard_short_samples", True):
                 logging.warning(
                     f"The length of '{id_}' is {L}, but it is shorter than "
                     f"any candidates of chunk-length: {self.chunk_lengths}"
                 )
                 continue
 
-            W = int(state.choice(chunk_lengths, 1))
-            cache_id_list = cache_id_list_dict.setdefault(W, [])
-            cache_chunks = cache_chunks_dict.setdefault(W, {})
+            # Convert numpy array to number
+            category = (
+                batch.get("utt2category", torch.tensor([0], dtype=torch.long))
+                .type(torch.int64)
+                .item()
+            )
 
-            # Shift width to the next chunk
-            S = int(W * self.chunk_shift_ratio)
-            # Number of chunks
-            N = (L - W) // S + 1
-            if shuffle:
-                Z = state.randint(0, (L - W) % S + 1)
+            if len(chunk_lengths) == 0:
+                # keep the batch as is
+                cache_id_list = cache_id_list_dict[category].setdefault(0, [])
+                cache_chunks = cache_chunks_dict[category].setdefault(0, {})
+                Z, N, W, S = 0, 1, L, 0
             else:
-                Z = 0
+                # Keep the legacy sampling semantics and avoid ndarray->scalar cast.
+                W = int(state.choice(chunk_lengths, size=1).item())
+                cache_id_list = cache_id_list_dict[category].setdefault(W, [])
+                cache_chunks = cache_chunks_dict[category].setdefault(W, {})
+
+                # Shift width to the next chunk
+                S = int(W * self.chunk_shift_ratio)
+                # Number of chunks
+                N = (L - W) // S + 1
+                if shuffle:
+                    Z = state.randint(0, (L - W) % S + 1)
+                else:
+                    Z = 0
 
             # Split a sequence into chunks.
             # Note that the marginal frames divided by chunk length are discarded
@@ -160,7 +261,21 @@ class ChunkIterFactory(AbsIterFactory):
                     cache_chunks[k] = []
                 if k in sequence_keys:
                     # Shift chunks with overlapped length for data augmentation
-                    cache_chunks[k] += [v[Z + i * S : Z + i * S + W] for i in range(N)]
+                    if self.excluded_key_pattern is not None and re.fullmatch(
+                        self.excluded_key_pattern, k
+                    ):
+                        for _ in range(N):
+                            cache_chunks[k].append(v)
+                    elif self.left_context > 0 and k in self.left_context_keys:
+                        C = self.left_context * fs // default_fs
+                        cache_chunks[k] += [
+                            self._with_left_context(v, Z + i * S, W, C)
+                            for i in range(N)
+                        ]
+                    else:
+                        cache_chunks[k] += [
+                            v[Z + i * S : Z + i * S + W] for i in range(N)
+                        ]
                 else:
                     # If not sequence, use whole data instead of chunk
                     cache_chunks[k] += [v for _ in range(N)]
@@ -174,20 +289,29 @@ class ChunkIterFactory(AbsIterFactory):
                     state,
                 )
 
-            cache_id_list_dict[W] = cache_id_list
-            cache_chunks_dict[W] = cache_chunks
+            if len(chunk_lengths) == 0:
+                W = 0
+            cache_id_list_dict[category][W] = cache_id_list
+            cache_chunks_dict[category][W] = cache_chunks
 
         else:
-            for W in cache_id_list_dict:
-                cache_id_list = cache_id_list_dict.setdefault(W, [])
-                cache_chunks = cache_chunks_dict.setdefault(W, {})
+            for category in cache_id_list_dict.keys():
+                for W in cache_id_list_dict[category]:
+                    cache_id_list = cache_id_list_dict[category].setdefault(W, [])
+                    cache_chunks = cache_chunks_dict[category].setdefault(W, {})
 
-                yield from self._generate_mini_batches(
-                    cache_id_list,
-                    cache_chunks,
-                    shuffle,
-                    state,
-                )
+                    yield from self._generate_mini_batches(
+                        cache_id_list,
+                        cache_chunks,
+                        shuffle,
+                        state,
+                    )
+
+    def prepare_for_collate(self, id_list, batches):
+        return [
+            (id_, {k: vs[i].numpy() for k, vs in batches.items()})
+            for i, id_ in enumerate(id_list)
+        ]
 
     def _generate_mini_batches(
         self,
@@ -205,10 +329,17 @@ class ChunkIterFactory(AbsIterFactory):
         bs = self.batch_size
         while len(id_list) >= bs:
             # Make mini-batch and yield
-            yield (
-                id_list[:bs],
-                {k: torch.stack(v[:bs], 0) for k, v in batches.items()},
-            )
+            if self.discard_short_samples:
+                yield (
+                    id_list[:bs],
+                    {k: torch.stack(v[:bs], 0) for k, v in batches.items()},
+                )
+            else:
+                yield self.collate_fn(
+                    self.prepare_for_collate(
+                        id_list[:bs], {k: v[:bs] for k, v in batches.items()}
+                    )
+                )
             id_list = id_list[bs:]
             batches = {k: v[bs:] for k, v in batches.items()}
 

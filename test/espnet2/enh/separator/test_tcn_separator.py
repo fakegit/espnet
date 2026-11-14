@@ -1,5 +1,4 @@
 import pytest
-
 import torch
 from torch import Tensor
 from torch_complex import ComplexTensor
@@ -15,8 +14,9 @@ from espnet2.enh.separator.tcn_separator import TCNSeparator
 @pytest.mark.parametrize("stack", [1, 3])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("num_spk", [1, 2])
-@pytest.mark.parametrize("nonlinear", ["relu", "sigmoid", "tanh"])
+@pytest.mark.parametrize("nonlinear", ["relu", "sigmoid", "tanh", "linear"])
 @pytest.mark.parametrize("norm_type", ["BN", "gLN", "cLN"])
+@pytest.mark.parametrize("masking", [True, False])
 def test_tcn_separator_forward_backward_complex(
     input_dim,
     layer,
@@ -28,6 +28,7 @@ def test_tcn_separator_forward_backward_complex(
     kernel,
     causal,
     norm_type,
+    masking,
 ):
     model = TCNSeparator(
         input_dim=input_dim,
@@ -40,6 +41,7 @@ def test_tcn_separator_forward_backward_complex(
         causal=causal,
         norm_type=norm_type,
         nonlinear=nonlinear,
+        masking=masking,
     )
     model.train()
 
@@ -50,7 +52,8 @@ def test_tcn_separator_forward_backward_complex(
 
     masked, flens, others = model(x, ilens=x_lens)
 
-    assert isinstance(masked[0], ComplexTensor)
+    if masking:
+        assert isinstance(masked[0], ComplexTensor)
     assert len(masked) == num_spk
 
     masked[0].abs().mean().backward()
@@ -66,6 +69,7 @@ def test_tcn_separator_forward_backward_complex(
 @pytest.mark.parametrize("num_spk", [1, 2])
 @pytest.mark.parametrize("nonlinear", ["relu", "sigmoid", "tanh"])
 @pytest.mark.parametrize("norm_type", ["BN", "gLN", "cLN"])
+@pytest.mark.parametrize("masking", [True, False])
 def test_tcn_separator_forward_backward_real(
     input_dim,
     layer,
@@ -77,6 +81,7 @@ def test_tcn_separator_forward_backward_real(
     kernel,
     causal,
     norm_type,
+    masking,
 ):
     model = TCNSeparator(
         input_dim=input_dim,
@@ -89,6 +94,7 @@ def test_tcn_separator_forward_backward_real(
         causal=causal,
         norm_type=norm_type,
         nonlinear=nonlinear,
+        masking=masking,
     )
 
     x = torch.rand(2, 10, input_dim)
@@ -116,7 +122,6 @@ def test_tcn_separator_invalid_type():
 
 
 def test_tcn_separator_output():
-
     x = torch.rand(2, 10, 10)
     x_lens = torch.tensor([10, 8], dtype=torch.long)
 
@@ -137,3 +142,54 @@ def test_tcn_separator_output():
         for n in range(num_spk):
             assert "mask_spk{}".format(n + 1) in others
             assert specs[n].shape == others["mask_spk{}".format(n + 1)].shape
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
+def test_tcn_streaming_dtype(dtype):
+    separator = (
+        TCNSeparator(input_dim=5, layer=2, stack=1, bottleneck_dim=5, hidden_dim=5)
+        .to(dtype)
+        .eval()
+    )
+    state = None
+    with torch.no_grad():
+        for _ in range(2):
+            frame = torch.randn(2, 1, 5, dtype=dtype)
+            masked, state, others = separator.forward_streaming(frame, state)
+            assert state.dtype == frame.dtype
+            assert all(output.dtype == frame.dtype for output in masked)
+            assert all(mask.dtype == frame.dtype for mask in others.values())
+
+
+def test_tcn_streaming():
+    SEQ_LEN = 100
+    num_spk = 2
+    BS = 2
+    separator = TCNSeparator(
+        input_dim=128,
+        num_spk=2,
+        layer=2,
+        stack=3,
+        bottleneck_dim=32,
+        hidden_dim=64,
+        kernel=3,
+        causal=True,
+        norm_type="cLN",
+    )
+    separator.eval()
+    input_feature = torch.randn((BS, SEQ_LEN, 128))
+    ilens = torch.LongTensor([SEQ_LEN] * BS)
+    with torch.no_grad():
+        seq_output, _, _ = separator.forward(input_feature, ilens=ilens)
+
+        state = None
+        stream_outputs = []
+        for i in range(SEQ_LEN):
+            frame = input_feature[:, i : i + 1, :]
+            frame_out, state, _ = separator.forward_streaming(frame, state)
+            stream_outputs.append(frame_out)
+        for i in range(SEQ_LEN):
+            for s in range(num_spk):
+                torch.testing.assert_close(
+                    stream_outputs[i][s], seq_output[s][:, i : i + 1, :]
+                )

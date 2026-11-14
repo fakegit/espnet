@@ -1,8 +1,9 @@
 import logging
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from typeguard import check_argument_types
+from typeguard import typechecked
 
 
 class CTC(torch.nn.Module):
@@ -10,49 +11,87 @@ class CTC(torch.nn.Module):
 
     Args:
         odim: dimension of outputs
-        encoder_output_sizse: number of encoder projection units
+        encoder_output_size: number of encoder projection units
         dropout_rate: dropout rate (0.0 ~ 1.0)
-        ctc_type: builtin or warpctc
+        ctc_type: builtin or gtnctc
         reduce: reduce the CTC loss into a scalar
+        ignore_nan_grad: Same as zero_infinity (keeping for backward compatiblity)
+        zero_infinity:  Whether to zero infinite losses and the associated gradients.
     """
 
+    @typechecked
     def __init__(
         self,
         odim: int,
-        encoder_output_sizse: int,
+        encoder_output_size: int,
         dropout_rate: float = 0.0,
         ctc_type: str = "builtin",
         reduce: bool = True,
-        ignore_nan_grad: bool = False,
+        ignore_nan_grad: Optional[bool] = None,
+        zero_infinity: bool = True,
+        brctc_risk_strategy: str = "exp",
+        brctc_group_strategy: str = "end",
+        brctc_risk_factor: float = 0.0,
     ):
-        assert check_argument_types()
         super().__init__()
-        eprojs = encoder_output_sizse
+        eprojs = encoder_output_size
         self.dropout_rate = dropout_rate
         self.ctc_lo = torch.nn.Linear(eprojs, odim)
         self.ctc_type = ctc_type
-        self.ignore_nan_grad = ignore_nan_grad
+        if ignore_nan_grad is not None:
+            zero_infinity = ignore_nan_grad
 
         if self.ctc_type == "builtin":
-            self.ctc_loss = torch.nn.CTCLoss(reduction="none")
-        elif self.ctc_type == "warpctc":
-            import warpctc_pytorch as warp_ctc
-
-            if ignore_nan_grad:
-                raise NotImplementedError(
-                    "ignore_nan_grad option is not supported for warp_ctc"
-                )
-            self.ctc_loss = warp_ctc.CTCLoss(size_average=True, reduce=reduce)
-        else:
-            raise ValueError(
-                f'ctc_type must be "builtin" or "warpctc": {self.ctc_type}'
+            self.ctc_loss = torch.nn.CTCLoss(
+                reduction="none", zero_infinity=zero_infinity
             )
+        elif self.ctc_type == "builtin2":
+            self.ignore_nan_grad = True
+            logging.warning("builtin2")
+            self.ctc_loss = torch.nn.CTCLoss(reduction="none")
+
+        elif self.ctc_type == "gtnctc":
+            from espnet2.legacy.nets.pytorch_backend.gtn_ctc import GTNCTCLossFunction
+
+            self.ctc_loss = GTNCTCLossFunction.apply
+
+        elif self.ctc_type == "brctc":
+            try:
+                import k2  # noqa
+            except ImportError:
+                raise ImportError("You should install K2 to use Bayes Risk CTC")
+
+            from espnet2.asr.bayes_risk_ctc import BayesRiskCTC
+
+            self.ctc_loss = BayesRiskCTC(
+                brctc_risk_strategy, brctc_group_strategy, brctc_risk_factor
+            )
+
+        else:
+            raise ValueError(f'ctc_type must be "builtin" or "gtnctc": {self.ctc_type}')
 
         self.reduce = reduce
 
     def loss_fn(self, th_pred, th_target, th_ilen, th_olen) -> torch.Tensor:
-        if self.ctc_type == "builtin":
-            th_pred = th_pred.log_softmax(2)
+        if self.ctc_type == "builtin" or self.ctc_type == "brctc":
+            th_pred = th_pred.log_softmax(2).float()
+            loss = self.ctc_loss(th_pred, th_target, th_ilen, th_olen)
+            if self.ctc_type == "builtin":
+                size = th_pred.size(1)
+            else:
+                size = loss.size(0)  # some invalid examples will be excluded
+
+            if self.reduce:
+                # Batch-size average
+                loss = loss.sum() / size
+            else:
+                loss = loss / size
+            return loss
+
+        # builtin2 ignores nan losses using the logic below, while
+        # builtin relies on the zero_infinity flag in pytorch CTC
+        elif self.ctc_type == "builtin2":
+            th_pred = th_pred.log_softmax(2).float()
             loss = self.ctc_loss(th_pred, th_target, th_ilen, th_olen)
 
             if loss.requires_grad and self.ignore_nan_grad:
@@ -67,6 +106,7 @@ class CTC(torch.nn.Module):
                         "All samples in this mini-batch got nan grad."
                         " Returning nan value instead of CTC loss"
                     )
+                    return loss
                 elif size != th_pred.size(1):
                     logging.warning(
                         f"{th_pred.size(1) - size}/{th_pred.size(1)}"
@@ -104,20 +144,10 @@ class CTC(torch.nn.Module):
                 loss = loss / size
             return loss
 
-        elif self.ctc_type == "warpctc":
-            # warpctc only supports float32
-            th_pred = th_pred.to(dtype=torch.float32)
+        elif self.ctc_type == "gtnctc":
+            log_probs = torch.nn.functional.log_softmax(th_pred, dim=2)
+            return self.ctc_loss(log_probs, th_target, th_ilen, 0, "none")
 
-            th_target = th_target.cpu().int()
-            th_ilen = th_ilen.cpu().int()
-            th_olen = th_olen.cpu().int()
-            loss = self.ctc_loss(th_pred, th_target, th_ilen, th_olen)
-            if self.reduce:
-                # NOTE: sum() is needed to keep consistency since warpctc
-                # return as tensor w/ shape (1,)
-                # but builtin return as tensor w/o shape (scalar).
-                loss = loss.sum()
-            return loss
         else:
             raise NotImplementedError
 
@@ -132,17 +162,37 @@ class CTC(torch.nn.Module):
         """
         # hs_pad: (B, L, NProj) -> ys_hat: (B, L, Nvocab)
         ys_hat = self.ctc_lo(F.dropout(hs_pad, p=self.dropout_rate))
-        # ys_hat: (B, L, D) -> (L, B, D)
-        ys_hat = ys_hat.transpose(0, 1)
 
-        # (B, L) -> (BxL,)
-        ys_true = torch.cat([ys_pad[i, :l] for i, l in enumerate(ys_lens)])
+        if self.ctc_type == "brctc":
+            loss = self.loss_fn(ys_hat, ys_pad, hlens, ys_lens).to(
+                device=hs_pad.device, dtype=hs_pad.dtype
+            )
+            return loss
+
+        elif self.ctc_type == "gtnctc":
+            # gtn expects list form for ys
+            ys_true = [y[y != -1] for y in ys_pad]  # parse padded ys
+        else:
+            # ys_hat: (B, L, D) -> (L, B, D)
+            ys_hat = ys_hat.transpose(0, 1)
+            # (B, L) -> (BxL,)
+            ys_true = torch.cat([ys_pad[i, :l] for i, l in enumerate(ys_lens)])
 
         loss = self.loss_fn(ys_hat, ys_true, hlens, ys_lens).to(
             device=hs_pad.device, dtype=hs_pad.dtype
         )
 
         return loss
+
+    def softmax(self, hs_pad):
+        """softmax of frame activations
+
+        Args:
+            Tensor hs_pad: 3d tensor (B, Tmax, eprojs)
+        Returns:
+            torch.Tensor: softmax applied 3d tensor (B, Tmax, odim)
+        """
+        return F.softmax(self.ctc_lo(hs_pad), dim=2)
 
     def log_softmax(self, hs_pad):
         """log_softmax of frame activations
@@ -163,3 +213,33 @@ class CTC(torch.nn.Module):
             torch.Tensor: argmax applied 2d tensor (B, Tmax)
         """
         return torch.argmax(self.ctc_lo(hs_pad), dim=2)
+
+    def forced_align(self, hs_pad, hlens, ys_pad, ys_lens, blank_idx=0):
+        """Force alignment between input and target sequences (Viterbi path).
+
+        Args:
+            hs_pad: batch of padded hidden state sequences (B, Tmax, D)
+            hlens: batch of lengths of hidden state sequences (B)
+            ys_pad: batch of padded character id sequence tensor (B, Lmax)
+            ys_lens: batch of lengths of character sequence (B)
+            blank_idx: index of blank symbol
+            Note: B must be 1.
+
+        Returns:
+            alignments: Tuple(tensor, tensor):
+                - Label for each time step in the alignment path computed
+                using forced alignment.
+                - Log probability scores of the labels for each time step.
+
+        """
+        import torchaudio
+
+        if self.ctc_type != "builtin":
+            raise NotImplementedError("force_align needs builtin CTC")
+        log_probs = self.log_softmax(hs_pad)  # (B, Tmax, odim)
+        assert log_probs.size(0) == 1, "Forced alignment needs batch size 1"
+        assert not (ys_pad == blank_idx).any(), "Target has blank tokens."
+        align_label, align_prob = torchaudio.functional.forced_align(
+            log_probs, ys_pad, hlens, ys_lens, blank=blank_idx
+        )
+        return align_label, align_prob

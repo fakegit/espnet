@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from espnet.transform.spectrogram import spectrogram
+from espnet2.legacy.transform.spectrogram import spectrogram
 from espnet2.tts.feats_extract.log_spectrogram import LogSpectrogram
 
 

@@ -1,12 +1,12 @@
 # Task class and data input system for training
 ## Task class
 
-In ESpnet1, we have too many duplicated python modules. 
-One of the big purposes of ESPnet2 is to provide a common interface and 
+In ESpnet1, we have too many duplicated python modules.
+One of the big purposes of ESPnet2 is to provide a common interface and
 enable us to focus more on the unique parts of each task.
 
-`Task` class is a common system to build training tools for each task, 
-ASR, TTS, LM, etc. inspired by `Fairseq Task` idea. 
+`Task` class is a common system to build training tools for each task,
+ASR, TTS, LM, etc. inspired by `Fairseq Task` idea.
 To build your task, only you have to do is just inheriting `AbsTask` class:
 
 ```python
@@ -55,9 +55,9 @@ if __name__ == "__main__":
 
 ## Data input system
 Espnet2 also provides a command line interface to describe the training corpus.
-On the contrary, unlike `fairseq` or training system such as `pytorch-lightining`, 
+On the contrary, unlike `fairseq` or training system such as `pytorch-lightning`,
 our `Task` class doesn't have an interface for building the dataset explicitly.
-This is because we aim at the task related to speech/text only, 
+This is because we aim at the task related to speech/text only,
 so we don't need such general system so far.
 
 The following is an example of the command lint arguments:
@@ -82,15 +82,15 @@ for batch in iterator:
 
 Where the `model` is same as the model built by `Task.build_model()`.
 
-You can flexibly construct this mini-batch object 
+You can flexibly construct this mini-batch object
 using `--*_data_path_and_name_and_type`.
-`--*_data_path_and_name_and_type` can be repeated as you need and 
+`--*_data_path_and_name_and_type` can be repeated as you need and
 each `--*_data_path_and_name_and_type` corresponds to an element in the mini-batch.
 Also, keep in mind that **there is no distinction between input and target data**.
 
 
-The argument of `--train_data_path_and_name_and_type` 
-should be given as three values separated by commas, 
+The argument of `--train_data_path_and_name_and_type`
+should be given as three values separated by commas,
 like `<file-path>,<key-name>,<file-format>`.
 
 - `key-name` specify the key of dict
@@ -106,8 +106,8 @@ python -m espnet2.bin.asr_train --help
 ```
 
 Almost all formats are referred as `scp` file  according to Kaldi-ASR.
-`scp` is just a text file which has two columns for each line: 
-The first indicates the sample id and the second is some value. 
+`scp` is just a text file which has two columns for each line:
+The first indicates the sample id and the second is some value.
 e.g. file path, transcription, a sequence of numbers.
 
 
@@ -139,11 +139,11 @@ e.g. file path, transcription, a sequence of numbers.
 
 
 ### `required_data_names()` and `optional_data_names()`
-Though an arbitrary dictionary can be created by this system, 
-each task assumes that the specific key is given for a specific purpose. 
+Though an arbitrary dictionary can be created by this system,
+each task assumes that the specific key is given for a specific purpose.
 e.g. ASR Task requires `speech` and `text` keys and
-each value is used for input data and target data respectively. 
-See again the methods of `Task` class: 
+each value is used for input data and target data respectively.
+See again the methods of `Task` class:
 `required_data_names()` and `optional_data_names()`.
 
 
@@ -176,7 +176,7 @@ python -m new_task \
   --train_data_path_and_name_and_type=filepath,unknown,sometype
 ```
 
-The intention of this system is just an assertion check, so if feel unnecessary, 
+The intention of this system is just an assertion check, so if feel unnecessary,
 you can turn off this checking with `--allow_variable_data_keys true`.
 
 ```bash
@@ -187,8 +187,8 @@ python -m new_task \
 ```
 
 
-## Customize `collcate_fn` for PyTorch data loader
-`Task` class has a method to customize `collcate_fn`:
+## Customize `collate_fn` for PyTorch data loader
+`Task` class has a method to customize `collate_fn`:
 
 ```python
 class NewTask(AbsTask):
@@ -197,23 +197,23 @@ class NewTask(AbsTask):
     ...
 ```
 
-`collcate_fn` is an argument of `torch.utils.data.DataLoader` and 
+`collate_fn` is an argument of `torch.utils.data.DataLoader` and
 it can modify the data which is received from data-loader. e.g.:
 
 ```python
-def collcate_fn(data):
+def collate_fn(data):
     # data is a list of the return value of Dataset class:
     modified_data = (...touch data)
     return modified_data
 
 from torch.utils.data import DataLoader
-data_loader = DataLoader(dataset, collcate_fn=collcate_fn)
+data_loader = DataLoader(dataset, collate_fn=collate_fn)
 for modified_data in data_loader:
     ...
 ```
 
-The type of argument is determined by the input `dataset` class and 
-our dataset is always `espnet2.train.dataset.ESPnetDataset`, 
+The type of argument is determined by the input `dataset` class and
+our dataset is always `espnet2.train.dataset.ESPnetDataset`,
 which the return value is a tuple of sample id and a dict of tensor,
 
 ```python
@@ -230,16 +230,16 @@ data = [
 ]
 ```
 
-The return type of collate_fn is supposed to be a tuple of list and a dict of tensor in espnet2, 
-so the collcate_fn for `Task` must transform the data type to it.
+The return type of collate_fn is supposed to be a tuple of list and a dict of tensor in espnet2,
+so the collate_fn for `Task` must transform the data type to it.
 
 ```python
 for ids, batch in data_loader:
   model(**batch)
 ```
 
-We provide common collate_fn and this function can support many cases, 
-so you might not need to customize it. 
+We provide common collate_fn and this function can support many cases,
+so you might not need to customize it.
 This collate_fn is aware of variable sequence features for seq2seq task:
 
 - The first axis of the sequence tensor from dataset must be length axis: e.g. (Length, Dim), (Length, Dim, Dim2), or (Length, ...)

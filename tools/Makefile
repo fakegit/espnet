@@ -1,239 +1,407 @@
-# If a Python interpreter is specified, then creates a virtualenv from it
-# If empty string is given, chainer is not installed. Note that ESPnet doesn't support any versions except for chainer=6.0.0
-CHAINER_VERSION := 6.0.0
-# Disable cupy installation
-NO_CUPY :=
-# PyTorch version: 0.4.1, 1.0.0, 1.0.1, 1.1.0, 1.2.0, 1.3.0, 1.3.1, 1.4.0, 1.5.0, 1.5.1, 1.6.0, 1.7.0, 1.7.1, 1.8.0, 1.8.1
-TH_VERSION := 1.4.0
-WGET := wget --tries=3
+# PyTorch version: The latest three versions have been tested.
+# Please check https://github.com/espnet/espnet?tab=readme-ov-file#espnet-end-to-end-speech-processing-toolkit
+# Only used when TH_VERSION is not passed in. ci/install.sh always passes it,
+# so this default is what a manual `make` and the docker build get - and it is
+# checked against ci/image_variants.json by ci/check_ci_image_config.py,
+# because install_torch.sh exits 1 on anything outside that set and nothing
+# noticed for five months when this said 2.7.1.
+#
+# Deliberately one behind the newest supported version: k2 publishes no wheel
+# for torch 2.14.0 yet (see k2_missing_for in installers/install_k2.sh), and a
+# plain `make` should not quietly come out without k2.
+TH_VERSION := 2.13.0
 
 # Use pip for pytorch installation even if you have anaconda
 ifneq ($(shell test -f ./activate_python.sh && grep 'conda activate' ./activate_python.sh),)
-IS_CONDA := 0
-USE_PIP :=
+USE_CONDA := 1
 else
-IS_CONDA :=
-USE_PIP := 0
+USE_CONDA :=
 endif
 
 
-# Set if install binaries on CPU mode e.g. make CPU_ONLY=1
-# If you don't have any GPUs, this value will be set automatically
-ifeq ($(shell which nvcc),) # 'nvcc' not found
-CPU_ONLY := 0
-else
+# Set if install binaries on CPU mode e.g. make CPU_ONLY=0
+# If you don't have nvcc, this value will be set automatically
+ifneq ($(shell which nvcc 2>/dev/null),)
 CPU_ONLY :=
-endif
-
-ifeq ($(strip $(CPU_ONLY)),)
 # Derive CUDA version from nvcc
-CUDA_VERSION = $(shell nvcc --version | grep "Cuda compilation tools" | cut -d" " -f5 | sed s/,//)
-CUDA_VERSION_WITHOUT_DOT = $(strip $(subst .,,$(CUDA_VERSION)))
-PIP_PYTORCH := torch==$(TH_VERSION) -f https://download.pytorch.org/whl/cu$(CUDA_VERSION_WITHOUT_DOT)/torch_stable.html
-ifeq ($(strip $(CUDA_VERSION_WITHOUT_DOT)),80)
-CONDA_PYTORCH := pytorch=$(TH_VERSION) cuda$(CUDA_VERSION_WITHOUT_DOT) -c pytorch
-else ifeq ($(strip $(CUDA_VERSION_WITHOUT_DOT)),111)
-CONDA_PYTORCH := pytorch=$(TH_VERSION) cudatoolkit=$(CUDA_VERSION) -c pytorch -c conda-forge
-else
-CONDA_PYTORCH := pytorch=$(TH_VERSION) cudatoolkit=$(CUDA_VERSION) -c pytorch
-endif
+CUDA_VERSION := $(shell nvcc --version | grep "Cuda compilation tools" | cut -d" " -f5 | sed s/,//)
+CUDA_VERSION_WITHOUT_DOT := $(strip $(subst .,,$(CUDA_VERSION)))
 
 else
-CONDA_PYTORCH := pytorch=$(TH_VERSION) cpuonly -c pytorch
-PIP_PYTORCH := torch==$(TH_VERSION) -f https://download.pytorch.org/whl/cpu/torch_stable.html
-NO_CUPY := 0
+CPU_ONLY := 0
+CUDA_VERSION :=
+CUDA_VERSION_WITHOUT_DOT :=
 endif
+WITH_OMP=ON
 
-ifeq ($(shell expr $(CUDA_VERSION_WITHOUT_DOT) \>= 102), 1)
-# cupy==6.0.0 doesn't support CUDA=10.2 or later
-NO_CUPY := 0
-endif
-PIP_CHAINER := chainer==$(CHAINER_VERSION)
+# Timer functions for measuring task execution time
+define start_timer
+	@echo "::group::$(1)"
+	@date +%s > .$(subst /,_,$(1))_start_time
+endef
 
+define end_timer_and_touch
+	@echo "::endgroup::"
+	@END_TIME=$$(date +%s); START_TIME=$$(cat .$(subst /,_,$(1))_start_time); ELAPSED=$$(($$END_TIME - $$START_TIME)); printf "⏱️  $(1) completed in %02d:%02d:%02d\n" $$(($$ELAPSED/3600)) $$(($$ELAPSED%3600/60)) $$(($$ELAPSED%60)); rm -f .$(subst /,_,$(1))_start_time
+	@touch $(subst /,_,$(1))
+endef
 
 .PHONY: all clean
 
-all: kaldi showenv python conda_packages.done sctk.done sph2pipe.done check_install
+all: showenv conda_packages.done python ffmpeg.done sctk check_install
 
-ifneq ($(strip $(CHAINER_VERSION)),)
-python: activate_python.sh espnet.done pytorch.done chainer.done
-extra: warp-ctc.done warp-transducer.done chainer_ctc.done nkf.done moses.done mwerSegmenter.done pesq kenlm.done pyopenjtalk.done py3mmseg.done beamformit.done fairseq.done
-else
-python: activate_python.sh espnet.done pytorch.done
-extra: warp-ctc.done warp-transducer.done nkf.done moses.done mwerSegmenter.done pesq kenlm.done pyopenjtalk.done py3mmseg.done beamformit.done fairseq.done
-endif
-
-
-kaldi:
-	test -f kaldi/egs/wsj/s5/utils/parse_options.sh || git clone --depth 1 https://github.com/kaldi-asr/kaldi
+python: activate_python.sh setuptools.done packaging.done espnet.done pytorch.done fairscale.done torch_optimizer.done flash_attn.done lightning.done
+extra: warp-transducer.done nkf.done moses.done mwerSegmenter.done pesq kenlm.done pyopenjtalk.done py3mmseg.done beamformit.done fairseq.done s3prl.done k2.done transformers.done phonemizer.done longformer.done muskits.done whisper.done rvad_fast.done sounfile_test parallel-wavegan.done lora.done sph2pipe torcheval.done
 
 activate_python.sh:
-	test -f activate_python.sh || { echo "Error: Run ./setup_python.sh or ./setup_anaconda.sh"; exit 1; }
+	test -f activate_python.sh || { echo "Error: Run ./setup_python.sh or ./setup_miniforge.sh"; exit 1; }
 
 ################ Logging ################
 showenv: activate_python.sh
 ifeq ($(strip $(CPU_ONLY)),)
 	@echo CUDA_VERSION=$(CUDA_VERSION)
-	. ./activate_python.sh && python3 check_pytorch_cuda_compatibility.py $(TH_VERSION) ${CUDA_VERSION} || { echo "Change TH_VERSION or CUDA_VERSION"; exit 1; }
 else
 	@echo Perform on CPU mode: CPU_ONLY=$(CPU_ONLY)
 endif
 	@echo PYTHON=$(shell . ./activate_python.sh && command -v python3)
 	@echo PYTHON_VERSION=$(shell . ./activate_python.sh && python3 --version)
-	@echo IS_CONDA=$(IS_CONDA)
-	@echo USE_PIP=$(USE_PIP)
+	@echo USE_CONDA=$(USE_CONDA)
 	@echo TH_VERSION=$(TH_VERSION)
-	@echo CONDA_PYTORCH=$(CONDA_PYTORCH)
-	@echo PIP_PYTORCH=$(PIP_PYTORCH)
-	@echo CHAINER_VERSION=$(CHAINER_VERSION)
-	@echo PIP_CHAINER=$(PIP_CHAINER)
-	@echo NO_CUPY=$(NO_CUPY)
+	@echo WITH_OMP=$(WITH_OMP)
 
 #########################################
 
+bc.done: activate_python.sh
+	$(call start_timer,bc.done)
+	. ./activate_python.sh && { command -v bc || conda install -y bc -c conda-forge; }
+	$(call end_timer_and_touch,bc.done)
 cmake.done: activate_python.sh
-	. ./activate_python.sh && { command -v cmake || conda install -y cmake; }
-	touch cmake.done
+	$(call start_timer,cmake.done)
+	. ./activate_python.sh && { command -v cmake || conda install -y "cmake<4.0"; }
+	$(call end_timer_and_touch,cmake.done)
 flac.done: activate_python.sh
+	$(call start_timer,flac.done)
 	. ./activate_python.sh && { command -v flac || conda install -y libflac -c conda-forge; }
-	touch flac.done
-ffmpeg.done: activate_python.sh
-	. ./activate_python.sh && { command -v ffmpeg || conda install -y ffmpeg -c conda-forge; }
-	touch ffmpeg.done
+	$(call end_timer_and_touch,flac.done)
 sox.done: activate_python.sh
+	$(call start_timer,sox.done)
 	. ./activate_python.sh && { command -v sox || conda install -y sox -c conda-forge; }
-	touch sox.done
+	$(call end_timer_and_touch,sox.done)
 sndfile.done: activate_python.sh
-	. ./activate_python.sh && { python3 -c "from ctypes.util import find_library as F; assert F('sndfile') is not None" || conda install -y libsndfile=1.0.28 -c conda-forge; }
-	touch sndfile.done
-ifneq ($(strip $(IS_CONDA)),)
-conda_packages.done: cmake.done flac.done ffmpeg.done sox.done sndfile.done
+	$(call start_timer,sndfile.done)
+	# NOTE(kamo): The wheel version of Soundfile includes shared library and it is refered in preference.
+	# However, some old linuxs are not compatible with the wheel, so libsndfile is installed for this case.
+	. ./activate_python.sh && { conda install -y libsndfile -c conda-forge; }
+	$(call end_timer_and_touch,sndfile.done)
+ifneq ($(strip $(USE_CONDA)),)
+conda_packages.done: bc.done cmake.done flac.done sox.done sndfile.done
 else
 conda_packages.done:
 endif
-	touch conda_packages.done
+	$(call start_timer,conda_packages.done)
+	$(call end_timer_and_touch,conda_packages.done)
 
-
-sctk.done:
-	./installers/install_sctk.sh
-	touch sctk.done
-sph2pipe.done:
-	./installers/install_sph2pipe.sh
-	touch sph2pipe.done
-
-
-ifneq ($(strip $(USE_PIP)),)
-pytorch.done: activate_python.sh
-	. ./activate_python.sh && python3 -m pip install numpy --upgrade  # Workaround for "ImportError: numpy.core.multiarray failed to import"
-	. ./activate_python.sh && python3 -m pip install $(PIP_PYTORCH)
-	touch pytorch.done
+ffmpeg.done: activate_python.sh
+	$(call start_timer,ffmpeg.done)
+ifneq ($(strip $(USE_CONDA)),)
+	. ./activate_python.sh && { command -v ffmpeg || conda install -y ffmpeg -c conda-forge; }
 else
-pytorch.done: activate_python.sh
-	. ./activate_python.sh && conda install -y $(CONDA_PYTORCH)
-	touch pytorch.done
+	. ./activate_python.sh && { command -v ffmpeg || ./installers/install_ffmpeg.sh; }
 endif
+	$(call end_timer_and_touch,ffmpeg.done)
+
+sctk: sctk/bin/sclite
+sctk/bin/sclite:
+	$(call start_timer,sctk/bin/sclite)
+	./installers/install_sctk.sh
+	$(call end_timer_and_touch,sctk/bin/sclite)
+
+sph2pipe: sph2pipe/sph2pipe
+sph2pipe/sph2pipe:
+	$(call start_timer,sph2pipe/sph2pipe)
+	./installers/install_sph2pipe.sh
+	$(call end_timer_and_touch,sph2pipe/sph2pipe)
+
+setuptools.done: activate_python.sh
+	$(call start_timer,setuptools.done)
+	# NOTE(jiatong): For python 3.12 case, as distutils are not default from 3.12
+	# --default-pip: without it, ensurepip installs only pip3 and pip3.X. On
+	# python 3.13 the bundled pip is newer than the pip==25.2 setup_venv.sh pins,
+	# so the upgrade really runs, removes venv/bin/pip and does not put it back.
+	# Every bare `pip` after this (install_fairscale.sh and ten other
+	# installers) then runs the system interpreter's pip: fairscale resolved
+	# torch there, pulled the CUDA build's ~3 GB of nvidia-* wheels, and filled
+	# the CI runner's disk.
+	. ./activate_python.sh && { python -m ensurepip --upgrade --default-pip; python -m pip install setuptools; }
+	$(call end_timer_and_touch,setuptools.done)
+
+packaging.done: setuptools.done
+	$(call start_timer,packaging.done)
+	. ./activate_python.sh && python3 -m pip install packaging
+	$(call end_timer_and_touch,packaging.done)
+
+numpy.done: activate_python.sh
+	$(call start_timer,numpy.done)
+ifeq ($(strip $(USE_CONDA)),)
+	. ./activate_python.sh && python3 -m pip install numpy
+else
+	. ./activate_python.sh && conda install -y numpy
+endif
+	$(call end_timer_and_touch,numpy.done)
+
+numba.done: numpy.done
+	$(call start_timer,numba.done)
+	. ./activate_python.sh && python3 -m pip install -U numba
+	$(call end_timer_and_touch,numba.done)
+
+# NOTE(kamo): Install numba before installing torch because numba requires specific numpy version now
+# (Pytorch is not related to numba directly)
+pytorch.done: packaging.done numba.done
+	$(call start_timer,pytorch.done)
+ifeq ($(strip $(USE_CONDA)),)
+	. ./activate_python.sh && ./installers/install_torch.sh "false" "${TH_VERSION}" "${CUDA_VERSION}"
+else
+	. ./activate_python.sh && ./installers/install_torch.sh "true" "${TH_VERSION}" "${CUDA_VERSION}"
+endif
+	$(call end_timer_and_touch,pytorch.done)
+
+lightning.done: pytorch.done
+	$(call start_timer,lightning.done)
+	. ./activate_python.sh && ./installers/install_lightning.sh
+	$(call end_timer_and_touch,lightning.done)
 
 # NOTE(kamo): conda_packages is not necessary for installation of espnet, but add it the dependencies just in case.
-espnet.done: pytorch.done conda_packages.done
-	. ./activate_python.sh && python3 -m pip install -e "..[recipe]"  # Install editable mode by default
-	touch espnet.done
+espnet.done: pytorch.done conda_packages.done lightning.done
+	$(call start_timer,espnet.done)
+	@echo NUMPY_VERSION=$(shell . ./activate_python.sh && python3 -c "import numpy; print(numpy.__version__)")
+	# Install additional packages that cannot be included in setup.py due to package build issues.
+	# The fork this used to install from git, now published under its own name
+	# because PyPI rejects a distribution whose metadata contains a git URL. It is
+	# also declared in the tts extra; the distributions are identical, so nothing
+	# installs two copies of g2p_en.
+	. ./activate_python.sh && python3 -m pip install espnet-g2p-en
+	. ./activate_python.sh && python3 -m pip install "ctc-segmentation==1.7.5"
+	# torch==$(TH_VERSION) on the same line, not because it is missing - it was
+	# installed above - but to hold it still. Unpinned, this resolve is free to
+	# move torch anywhere the dependency range allows, and it did: it dropped
+	# 2.13.0 for 2.12.1, so install_k2.sh then built against 2.12.1 and the
+	# version check at the end of ci/install.sh failed the job.
+	. ./activate_python.sh && python3 -m pip install -e "..[train]" "torch==$(TH_VERSION)"  # Install editable mode by default; recipes train, so the [train] extra comes along
+	@echo NUMPY_VERSION=$(shell . ./activate_python.sh && python3 -c "import numpy; print(numpy.__version__)")
+	# Into the venv, not $$HOME. docker/ci.dockerfile builds in a builder stage
+	# and copies only /espnet/tools into the final image, so a download to
+	# /root/nltk_data - nltk's default - is left behind in the discarded stage
+	# and the prebuilt image ships without the tagger. <prefix>/share/nltk_data
+	# is on nltk's default search path and lives inside the venv, so it is
+	# copied, and it is found without depending on who $$HOME belongs to.
+	. ./activate_python.sh && installers/install_nltk_data.sh \
+		averaged_perceptron_tagger_eng \
+		"$$(python -c 'import sys; print(sys.prefix)')/share/nltk_data"
+	# nltk.downloader exits 0 on some failures, so check the download landed.
+	# Two things this deliberately does not do. Not nltk.data.find: that
+	# searches $$HOME too, so it passes on a machine that happens to have the
+	# tagger there - including the builder stage whose /root/nltk_data is then
+	# discarded, which is the bug being guarded. And not assert: PYTHONOPTIMIZE
+	# strips those, and execution then falls through to the print, so the step
+	# reports success and names a file that is not there. A guard against a
+	# silent omission must not itself be silenceable.
+	. ./activate_python.sh && python -c "import pathlib, sys; p = pathlib.Path(sys.prefix) / 'share/nltk_data/taggers/averaged_perceptron_tagger_eng.zip'; print('nltk tagger:', p) if p.is_file() else sys.exit('nltk tagger was not downloaded into the venv: %s' % p)"
+	$(call end_timer_and_touch,espnet.done)
 
-chainer.done: espnet.done
-ifneq ($(strip $(NO_CUPY)),)
-	. ./activate_python.sh && python3 -m pip install $(PIP_CHAINER)
-else
-	# Precompiled cupy==6.0.0 for python>=3.8 is not provided
-	. ./activate_python.sh && \
-		if python3 -c "import sys; from distutils.version import LooseVersion as L; assert L(sys.version) < L('3.8')" 2>&1 /dev/null; then \
-			python3 -m pip install $(PIP_CHAINER) cupy-cuda$(CUDA_VERSION_WITHOUT_DOT)==$(CHAINER_VERSION); \
-		else \
-			python3 -m pip install $(PIP_CHAINER) cupy==$(CHAINER_VERSION); \
-		fi
-endif
-	# chainer=6.0.0 depends on typing<=3.6.6, but this causes the following error when installing some modules. e.g. fairseq
-	# AttributeError: type object 'Callable' has no attribute '_abc_registry'
-	# "typing" modules is not required for python>=3.6, so uninstall here
-	. ./activate_python.sh && python3 -m pip uninstall -y typing
-	touch chainer.done
-
-# NOTE(kamo): Add conda_packages.done if cmake is used
-warp-ctc.done: pytorch.done conda_packages.done
-ifeq ($(strip $(CPU_ONLY)),)
-	[ -n "${CUDA_HOME}" ] || { echo -e "Error: CUDA_HOME is not set.\n    $$ . ./setup_cuda_env.sh <cuda-root>"; exit 1; }
-endif
-	. ./activate_python.sh && ./installers/install_warp-ctc.sh
-	touch warp-ctc.done
+sounfile_test: espnet.done
+	$(call start_timer,sounfile_test)
+	. ./activate_python.sh && python3 ./test_soundfile.py
+	$(call end_timer_and_touch,sounfile_test)
 
 warp-transducer.done: pytorch.done conda_packages.done
-ifeq ($(strip $(CPU_ONLY)),)
-	[ -n "${CUDA_HOME}" ] || { echo -e "Error: CUDA_HOME is not set.\n    $$ . ./setup_cuda_env.sh <cuda-root>"; exit 1; }
-	. ./activate_python.sh && ./installers/install_warp-transducer.sh
-	. ./activate_python.sh &&  ./installers/install_warp-rnnt.sh $(CUDA_VERSION)
-	touch warp-transducer.done
-else
-	. ./activate_python.sh && ./installers/install_warp-transducer.sh
-	touch warp-transducer.done
-endif
-
-chainer_ctc.done: chainer.done
+	$(call start_timer,warp-transducer.done)
 ifeq ($(strip $(CPU_ONLY)),)
 	[ -n "${CUDA_HOME}" ] || { echo -e "Error: CUDA_HOME is not set.\n    $$ . ./setup_cuda_env.sh <cuda-root>"; exit 1; }
 endif
-	. ./activate_python.sh && ./installers/install_chainer_ctc.sh
-	touch chainer_ctc.done
+	. ./activate_python.sh && ./installers/install_warp-transducer.sh ${WITH_OMP}
+	$(call end_timer_and_touch,warp-transducer.done)
 
 nkf.done:
+	$(call start_timer,nkf.done)
 	./installers/install_nkf.sh
-	touch nkf.done
+	$(call end_timer_and_touch,nkf.done)
 
 pyopenjtalk.done: espnet.done conda_packages.done
+	$(call start_timer,pyopenjtalk.done)
 	. ./activate_python.sh && ./installers/install_pyopenjtalk.sh
-	touch pyopenjtalk.done
+	$(call end_timer_and_touch,pyopenjtalk.done)
+
+phonemizer.done: espnet.done conda_packages.done
+	$(call start_timer,phonemizer.done)
+ifeq ($(WITH_OMP),ON)
+	. ./activate_python.sh && ./installers/install_phonemizer.sh
+else
+	# FIXME(kamo): I don't know how to avoid "-fopenmp" option
+	echo "Warning: ./installers/install_phonemizer.sh requires WITH_OMP=ON"
+endif
+	$(call end_timer_and_touch,phonemizer.done)
+
+speechbrain.done: espnet.done conda_packages.done
+	$(call start_timer,speechbrain.done)
+	. ./activate_python.sh && ./installers/install_speechbrain.sh
+	$(call end_timer_and_touch,speechbrain.done)
+
+mfa.done: espnet.done pyopenjtalk.done phonemizer.done conda_packages.done
+	$(call start_timer,mfa.done)
+ifneq ($(strip $(USE_CONDA)),)
+	. ./activate_python.sh && ./installers/install_mfa.sh "true"
+else
+	. ./activate_python.sh && ./installers/install_mfa.sh "false"
+endif
+	$(call end_timer_and_touch,mfa.done)
 
 moses.done:
+	$(call start_timer,moses.done)
 	git clone --depth 1 https://github.com/moses-smt/mosesdecoder.git moses
-	touch moses.done
+	$(call end_timer_and_touch,moses.done)
 
 mwerSegmenter.done:
+	$(call start_timer,mwerSegmenter.done)
 	./installers/install_mwerSegmenter.sh
-	touch mwerSegmenter.done
+	$(call end_timer_and_touch,mwerSegmenter.done)
 
 kenlm.done: espnet.done conda_packages.done
+	$(call start_timer,kenlm.done)
 	. ./activate_python.sh && ./installers/install_kenlm.sh
-	touch kenlm.done
+	$(call end_timer_and_touch,kenlm.done)
 
 pesq: PESQ/P862_annex_A_2005_CD/source/PESQ
 PESQ/P862_annex_A_2005_CD/source/PESQ:
+	$(call start_timer,PESQ/P862_annex_A_2005_CD/source/PESQ)
 	./installers/install_pesq.sh
+	$(call end_timer_and_touch,PESQ/P862_annex_A_2005_CD/source/PESQ)
 
 py3mmseg.done: espnet.done
+	$(call start_timer,py3mmseg.done)
 	. ./activate_python.sh && ./installers/install_py3mmseg.sh
-	touch py3mmseg.done
+	$(call end_timer_and_touch,py3mmseg.done)
 
 beamformit.done:
+	$(call start_timer,beamformit.done)
 	./installers/install_beamformit.sh
-	touch beamformit.done
+	$(call end_timer_and_touch,beamformit.done)
+
+torch_optimizer.done: espnet.done
+	$(call start_timer,torch_optimizer.done)
+	. ./activate_python.sh && ./installers/install_torch_optimizer.sh
+	$(call end_timer_and_touch,torch_optimizer.done)
+
+fairscale.done: espnet.done
+	$(call start_timer,fairscale.done)
+	. ./activate_python.sh && ./installers/install_fairscale.sh
+	$(call end_timer_and_touch,fairscale.done)
 
 fairseq.done: espnet.done
+	$(call start_timer,fairseq.done)
 	. ./activate_python.sh && ./installers/install_fairseq.sh
-	touch fairseq.done
+	$(call end_timer_and_touch,fairseq.done)
+
+s3prl.done: espnet.done
+	$(call start_timer,s3prl.done)
+	. ./activate_python.sh && ./installers/install_s3prl.sh
+	$(call end_timer_and_touch,s3prl.done)
+
+lang2vec.done: espnet.done
+	$(call start_timer,lang2vec.done)
+	. ./activate_python.sh && ./installers/install_lang2vec.sh
+	$(call end_timer_and_touch,lang2vec.done)
+
+whisper.done: espnet.done
+	$(call start_timer,whisper.done)
+	. ./activate_python.sh && ./installers/install_whisper.sh
+	$(call end_timer_and_touch,whisper.done)
+
+lora.done: espnet.done
+	$(call start_timer,lora.done)
+	. ./activate_python.sh && ./installers/install_lora.sh
+	$(call end_timer_and_touch,lora.done)
+
+k2.done: espnet.done
+	$(call start_timer,k2.done)
+	. ./activate_python.sh && ./installers/install_k2.sh
+	$(call end_timer_and_touch,k2.done)
+
+gtn.done: espnet.done
+	$(call start_timer,gtn.done)
+	. ./activate_python.sh && ./installers/install_gtn.sh
+	$(call end_timer_and_touch,gtn.done)
+
+transformers.done: espnet.done
+	$(call start_timer,transformers.done)
+	. ./activate_python.sh && ./installers/install_transformers.sh
+	$(call end_timer_and_touch,transformers.done)
+
+torcheval.done: pytorch.done
+	$(call start_timer,torcheval.done)
+	. ./activate_python.sh && ./installers/install_torcheval.sh
+	$(call end_timer_and_touch,torcheval.done)
+
+parallel-wavegan.done: espnet.done
+	$(call start_timer,parallel-wavegan.done)
+	. ./activate_python.sh && ./installers/install_parallel-wavegan.sh
+	$(call end_timer_and_touch,parallel-wavegan.done)
+
+longformer.done: espnet.done
+	$(call start_timer,longformer.done)
+	. ./activate_python.sh && ./installers/install_longformer.sh
+	$(call end_timer_and_touch,longformer.done)
+
+flash_attn.done: espnet.done
+	$(call start_timer,flash_attn.done)
+	. ./activate_python.sh && ./installers/install_flash_attn.sh
+	$(call end_timer_and_touch,flash_attn.done)
+
+muskits.done: espnet.done
+	$(call start_timer,muskits.done)
+	. ./activate_python.sh && ./installers/install_muskits.sh
+	$(call end_timer_and_touch,muskits.done)
+
+cauchy_mult.done: espnet.done
+	$(call start_timer,cauchy_mult.done)
+	. ./activate_python.sh && ./installers/install_cauchy_mult.sh
+	$(call end_timer_and_touch,cauchy_mult.done)
+
+rvad_fast.done: espnet.done
+	$(call start_timer,rvad_fast.done)
+	git clone https://github.com/zhenghuatan/rVADfast.git
+	$(call end_timer_and_touch,rvad_fast.done)
+
+discrete_speech_metrics.done: espnet.done
+	$(call start_timer,discrete_speech_metrics.done)
+	. ./activate_python.sh && ./installers/install_discrete_speech_metrics.sh
+	$(call end_timer_and_touch,discrete_speech_metrics.done)
+
+versa.done: espnet.done
+	$(call start_timer,versa.done)
+	. ./activate_python.sh && ./installers/install_versa.sh
+	$(call end_timer_and_touch,versa.done)
 
 check_install: python
 	. ./activate_python.sh; . ./extra_path.sh; python3 check_install.py
 
-
 clean: clean_extra
-	rm -rf warp-ctc warp-transducer warp-rnnt chainer_ctc
+	rm -rf warp-transducer
 	rm -rf *.done
 	find . -iname "*.pyc" -delete
 
 clean_python:
-	rm -rf warp-ctc warp-transducer warp-rnnt chainer_ctc
-	rm -f warp-ctc.done chainer_ctc.done espnet.done chainer.done pytorch.done warp-transducer.done
+	rm -rf warp-transducer
+	rm -f espnet.done pytorch.done warp-transducer.done
 	find . -iname "*.pyc" -delete
 
 clean_extra:
 	rm -rf nkf.done swig.done moses.done mwerSegmenter.done
 	rm -rf hts_engine_API.done open_jtalk.done pyopenjtalk.done
+	rm -rf muskits.done
+	rm -rf rvad_fast.done
+	rm -rf lightning_constraints.txt
+	rm -rf torcheval_constraints.txt
+	rm -rf espeak-ng festival MBROLA ParallelWaveGAN versa
+	rm -rf py3mmseg sctk* speech_tools sph2pipe* ._mwerSegmenter
 	rm -rf nkf mecab swig moses mwerSegmenter
 	rm -rf PESQ PESQ.zip

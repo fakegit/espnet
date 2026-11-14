@@ -1,22 +1,20 @@
-from pathlib import Path
-from typing import Iterable
-from typing import List
-from typing import Union
 import warnings
+from pathlib import Path
+from typing import Iterable, List, Optional, Union
 
-from typeguard import check_argument_types
+from typeguard import typechecked
 
 from espnet2.text.abs_tokenizer import AbsTokenizer
 
 
 class WordTokenizer(AbsTokenizer):
+    @typechecked
     def __init__(
         self,
-        delimiter: str = None,
-        non_linguistic_symbols: Union[Path, str, Iterable[str]] = None,
+        delimiter: Optional[str] = None,
+        non_linguistic_symbols: Union[Path, str, Iterable[str], None] = None,
         remove_non_linguistic_symbols: bool = False,
     ):
-        assert check_argument_types()
         self.delimiter = delimiter
 
         if not remove_non_linguistic_symbols and non_linguistic_symbols is not None:
@@ -29,8 +27,12 @@ class WordTokenizer(AbsTokenizer):
             self.non_linguistic_symbols = set()
         elif isinstance(non_linguistic_symbols, (Path, str)):
             non_linguistic_symbols = Path(non_linguistic_symbols)
-            with non_linguistic_symbols.open("r", encoding="utf-8") as f:
-                self.non_linguistic_symbols = set(line.rstrip() for line in f)
+            try:
+                with non_linguistic_symbols.open("r", encoding="utf-8") as f:
+                    self.non_linguistic_symbols = set(line.rstrip() for line in f)
+            except FileNotFoundError:
+                warnings.warn(f"{non_linguistic_symbols} doesn't exist.")
+                self.non_linguistic_symbols = set()
         else:
             self.non_linguistic_symbols = set(non_linguistic_symbols)
         self.remove_non_linguistic_symbols = remove_non_linguistic_symbols

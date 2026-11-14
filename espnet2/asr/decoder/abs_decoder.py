@@ -1,10 +1,9 @@
-from abc import ABC
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from typing import Tuple
 
 import torch
 
-from espnet.nets.scorer_interface import ScorerInterface
+from espnet2.legacy.nets.scorer_interface import ScorerInterface
 
 
 class AbsDecoder(torch.nn.Module, ScorerInterface, ABC):

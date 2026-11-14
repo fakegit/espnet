@@ -1,12 +1,8 @@
-from typing import Any
-from typing import Dict
-from typing import Optional
-from typing import Tuple
-from typing import Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import humanfriendly
 import torch
-from typeguard import check_argument_types
+from typeguard import typechecked
 
 from espnet2.layers.log_mel import LogMel
 from espnet2.layers.stft import Stft
@@ -14,16 +10,17 @@ from espnet2.tts.feats_extract.abs_feats_extract import AbsFeatsExtract
 
 
 class LogMelFbank(AbsFeatsExtract):
-    """Conventional frontend structure for ASR
+    """Conventional frontend structure for TTS.
 
     Stft -> amplitude-spec -> Log-Mel-Fbank
     """
 
+    @typechecked
     def __init__(
         self,
         fs: Union[int, str] = 16000,
         n_fft: int = 1024,
-        win_length: int = None,
+        win_length: Optional[int] = None,
         hop_length: int = 256,
         window: Optional[str] = "hann",
         center: bool = True,
@@ -33,8 +30,8 @@ class LogMelFbank(AbsFeatsExtract):
         fmin: Optional[int] = 80,
         fmax: Optional[int] = 7600,
         htk: bool = False,
+        log_base: Optional[float] = 10.0,
     ):
-        assert check_argument_types()
         super().__init__()
         if isinstance(fs, str):
             fs = humanfriendly.parse_size(fs)
@@ -65,7 +62,7 @@ class LogMelFbank(AbsFeatsExtract):
             fmin=fmin,
             fmax=fmax,
             htk=htk,
-            log_base=10.0,
+            log_base=log_base,
         )
 
     def output_size(self) -> int:

@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 import argparse
-from collections import OrderedDict
-from distutils.util import strtobool
 import itertools
 import logging
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
-from tempfile import TemporaryDirectory
 import warnings
+from collections import OrderedDict
+from distutils.util import strtobool
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import museval
 import numpy as np
-from pystoi.stoi import stoi
 import soundfile
+from pystoi.stoi import stoi
 
-from espnet.utils.cli_utils import get_commandline_args
+from espnet2.legacy.utils.cli_utils import get_commandline_args
 
 
 def eval_STOI(ref, y, fs, extended=False, compute_permutation=True):
@@ -358,7 +358,7 @@ def main():
         # 4. Evaluates
         for evaltype in args.evaltypes:
             if evaltype == "SDR":
-                (sdr, isr, sir, sar, perm) = museval.metrics.bss_eval(
+                sdr, isr, sir, sar, perm = museval.metrics.bss_eval(
                     ref_signals,
                     enh_signals,
                     window=np.inf,

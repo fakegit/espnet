@@ -1,44 +1,65 @@
-from abc import ABC
-from abc import abstractmethod
 import collections
 import copy
 import functools
+import json
 import logging
 import numbers
+import random
 import re
-from typing import Any
-from typing import Callable
-from typing import Collection
-from typing import Dict
-from typing import Mapping
-from typing import Tuple
-from typing import Union
+import types  # noqa
+from abc import ABC, abstractmethod
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
-import h5py
 import humanfriendly
-import kaldiio
 import numpy as np
 import torch
+from omniio import kaldi as kaldi_io
 from torch.utils.data.dataset import Dataset
-from typeguard import check_argument_types
-from typeguard import check_return_type
+from typeguard import typechecked
 
+from espnet2.fileio.json_scp import JsonScpReader
+from espnet2.fileio.multi_sound_scp import MultiSoundScpReader
 from espnet2.fileio.npy_scp import NpyScpReader
-from espnet2.fileio.rand_gen_dataset import FloatRandomGenerateDataset
-from espnet2.fileio.rand_gen_dataset import IntRandomGenerateDataset
-from espnet2.fileio.read_text import load_num_sequence_text
-from espnet2.fileio.read_text import read_2column_text
+from espnet2.fileio.omniio_audio import OmniIOAudioScpReader, OmniIOSegmentsReader
+from espnet2.fileio.rand_gen_dataset import (
+    FloatRandomGenerateDataset,
+    IntRandomGenerateDataset,
+)
+from espnet2.fileio.read_text import (
+    RandomTextReader,
+    load_num_sequence_text,
+    read_2columns_text,
+    read_label,
+)
 from espnet2.fileio.rttm import RttmReader
+from espnet2.fileio.score_scp import SingingScoreReader
 from espnet2.fileio.sound_scp import SoundScpReader
+from espnet2.fileio.vad_intervals import VadIntervalsReader
 from espnet2.utils.sized_dict import SizedDict
 
 
 class AdapterForSoundScpReader(collections.abc.Mapping):
-    def __init__(self, loader, dtype=None):
-        assert check_argument_types()
+    def __init__(
+        self,
+        loader,
+        dtype: Union[None, str] = None,
+        allow_multi_rates: bool = False,
+    ):
         self.loader = loader
         self.dtype = dtype
         self.rate = None
+        self.allow_multi_rates = allow_multi_rates
 
     def keys(self):
         return self.loader.keys()
@@ -49,30 +70,54 @@ class AdapterForSoundScpReader(collections.abc.Mapping):
     def __iter__(self):
         return iter(self.loader)
 
-    def __getitem__(self, key: str) -> np.ndarray:
-        retval = self.loader[key]
+    def __getitem__(self, key: str) -> Optional[np.ndarray]:
+        # For Kaldi IO to check missing audio cases
+        if hasattr(self.loader, "_dict") and self.loader._dict[key] == "None":
+            retval = None, None
+        else:
+            retval = self.loader[key]
+        return self._to_array(retval)
 
+    def read_span(self, key: str, start: int, end: int) -> np.ndarray:
+        """Return samples `start`..`end` - 1 of `key`.
+
+        A loader with ``read_span`` (e.g. Omni-IO) reads only that part; any
+        other is read whole and sliced.
+        """
+        if hasattr(self.loader, "read_span"):
+            return self._to_array(self.loader.read_span(key, start, end))
+        array = self[key]
+        if array is None or not start < end <= len(array):
+            raise ValueError(f"samples {start}-{end} out of the audio of {key}")
+        return array[start:end]
+
+    def _to_array(self, retval) -> Optional[np.ndarray]:
         if isinstance(retval, tuple):
             assert len(retval) == 2, len(retval)
             if isinstance(retval[0], int) and isinstance(retval[1], np.ndarray):
                 # sound scp case
                 rate, array = retval
-            elif isinstance(retval[0], int) and isinstance(retval[1], np.ndarray):
+            elif isinstance(retval[1], int) and isinstance(retval[0], np.ndarray):
                 # Extended ark format case
                 array, rate = retval
+            # NOTE(jiatong): for missing audio cases
+            elif retval[0] is None or retval[1] is None:
+                array, rate = None, self.rate
             else:
                 raise RuntimeError(
                     f"Unexpected type: {type(retval[0])}, {type(retval[1])}"
                 )
 
-            if self.rate is not None and self.rate != rate:
+            if not self.allow_multi_rates and (
+                self.rate is not None and self.rate != rate
+            ):
                 raise RuntimeError(
                     f"Sampling rates are mismatched: {self.rate} != {rate}"
                 )
             self.rate = rate
             # Multichannel wave fie
             # array: (NSample, Channel) or (Nsample)
-            if self.dtype is not None:
+            if self.dtype is not None and array is not None:
                 array = array.astype(self.dtype)
 
         else:
@@ -82,12 +127,19 @@ class AdapterForSoundScpReader(collections.abc.Mapping):
             if self.dtype is not None:
                 array = array.astype(self.dtype)
 
-        assert isinstance(array, np.ndarray), type(array)
+        if array is not None:
+            assert isinstance(array, np.ndarray), type(array)
         return array
 
 
 class H5FileWrapper:
+    @typechecked
     def __init__(self, path: str):
+        try:
+            import h5py
+        except ImportError:
+            raise RuntimeError("Please install espnet with `pip install espnet[test]`.")
+
         self.path = path
         self.h5_file = h5py.File(path, "r")
 
@@ -105,7 +157,62 @@ class H5FileWrapper:
         return value[()]
 
 
-def sound_loader(path, float_dtype=None):
+class AdapterForSingingScoreScpReader(collections.abc.Mapping):
+    def __init__(self, loader):
+        self.loader = loader
+
+    def keys(self):
+        return self.loader.keys()
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        return iter(self.loader)
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        retval = self.loader[key]
+        assert (
+            len(retval) == 3
+            and isinstance(retval["tempo"], int)
+            and isinstance(retval["note"], list)
+        )
+        tempo = retval["tempo"]
+
+        return tempo, retval["note"]
+
+
+class AdapterForLabelScpReader(collections.abc.Mapping):
+    @typechecked
+    def __init__(self, loader: Dict[str, List[List[Union[str, float, int]]]]):
+        self.loader = loader
+
+    def keys(self):
+        return self.loader.keys()
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        return iter(self.loader)
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        retval = self.loader[key]
+
+        assert isinstance(retval, list)
+        seq_len = len(retval)
+        sample_time = np.zeros((seq_len, 2))
+        sample_label = []
+        for i in range(seq_len):
+            sample_time[i, 0] = np.float32(retval[i][0])
+            sample_time[i, 1] = np.float32(retval[i][1])
+            sample_label.append(retval[i][2])
+
+        assert isinstance(sample_time, np.ndarray) and isinstance(sample_label, list)
+        return sample_time, sample_label
+
+
+def sound_loader(path, float_dtype=None, multi_columns=False, allow_multi_rates=False):
     # The file is as follows:
     #   utterance_id_A /some/where/a.wav
     #   utterance_id_B /some/where/a.flac
@@ -113,16 +220,74 @@ def sound_loader(path, float_dtype=None):
     # NOTE(kamo): SoundScpReader doesn't support pipe-fashion
     # like Kaldi e.g. "cat a.wav |".
     # NOTE(kamo): The audio signal is normalized to [-1,1] range.
-    loader = SoundScpReader(path, normalize=True, always_2d=False)
+    loader = SoundScpReader(
+        path, always_2d=False, dtype=float_dtype, multi_columns=multi_columns
+    )
 
     # SoundScpReader.__getitem__() returns Tuple[int, ndarray],
     # but ndarray is desired, so Adapter class is inserted here
-    return AdapterForSoundScpReader(loader, float_dtype)
+    return AdapterForSoundScpReader(loader, allow_multi_rates=allow_multi_rates)
 
 
-def kaldi_loader(path, float_dtype=None, max_cache_fd: int = 0):
-    loader = kaldiio.load_scp(path, max_cache_fd=max_cache_fd)
-    return AdapterForSoundScpReader(loader, float_dtype)
+def multi_columns_sound_loader(path, float_dtype=None, allow_multi_rates=False):
+    return sound_loader(
+        path, float_dtype, multi_columns=True, allow_multi_rates=allow_multi_rates
+    )
+
+
+def variable_columns_sound_loader(path, float_dtype=None, allow_multi_rates=False):
+    # The file is as follows:
+    #   utterance_id_A /some/where/a1.wav /some/where/a2.wav /some/where/a3.wav
+    #   utterance_id_B /some/where/b1.flac /some/where/b2.flac
+
+    # NOTE(wangyou): SoundScpReader doesn't support pipe-fashion
+    # like Kaldi e.g. "cat a.wav |".
+    # NOTE(wangyou): The audio signal is normalized to [-1,1] range.
+    loader = MultiSoundScpReader(path, always_2d=False, dtype=float_dtype, stack_axis=0)
+    return AdapterForSoundScpReader(loader, allow_multi_rates=allow_multi_rates)
+
+
+def score_loader(path):
+    loader = SingingScoreReader(fname=path)
+    return AdapterForSingingScoreScpReader(loader)
+
+
+def label_loader(path):
+    loader = read_label(path)
+    return AdapterForLabelScpReader(loader)
+
+
+def kaldi_loader(
+    path, float_dtype=None, max_cache_fd: int = 0, allow_multi_rates=False
+):
+    loader = kaldi_io.load_scp(path, max_cache_fd=max_cache_fd)
+    return AdapterForSoundScpReader(
+        loader, float_dtype, allow_multi_rates=allow_multi_rates
+    )
+
+
+def omniio_loader(
+    path, float_dtype=None, max_cache_fd: int = 32, allow_multi_rates=False
+):
+    """Load audio from Omni-IO archives through an scp of byte ranges."""
+    loader = OmniIOAudioScpReader(path, always_2d=False, max_cache_fd=max_cache_fd)
+    return AdapterForSoundScpReader(
+        loader, float_dtype, allow_multi_rates=allow_multi_rates
+    )
+
+
+def omniio_segments_loader(
+    path, float_dtype=None, max_cache_fd: int = 32, allow_multi_rates=False
+):
+    """Load Kaldi segments of recordings in Omni-IO archives.
+
+    `path` is the segments file; the recordings' scp is the ``wav.scp`` next
+    to it. Only each segment's part of its archive entry is read.
+    """
+    loader = OmniIOSegmentsReader(path, always_2d=False, max_cache_fd=max_cache_fd)
+    return AdapterForSoundScpReader(
+        loader, float_dtype, allow_multi_rates=allow_multi_rates
+    )
 
 
 def rand_int_loader(filepath, loader_type):
@@ -137,20 +302,86 @@ def rand_int_loader(filepath, loader_type):
 DATA_TYPES = {
     "sound": dict(
         func=sound_loader,
-        kwargs=["float_dtype"],
+        kwargs=["float_dtype", "allow_multi_rates"],
         help="Audio format types which supported by sndfile wav, flac, etc."
         "\n\n"
         "   utterance_id_a a.wav\n"
         "   utterance_id_b b.wav\n"
         "   ...",
     ),
+    "multi_columns_sound": dict(
+        func=multi_columns_sound_loader,
+        kwargs=["float_dtype", "allow_multi_rates"],
+        help="Enable multi columns wav.scp. "
+        "The following text file can be loaded as multi channels audio data"
+        "\n\n"
+        "   utterance_id_a a.wav a2.wav\n"
+        "   utterance_id_b b.wav b2.wav\n"
+        "   ...",
+    ),
+    "variable_columns_sound": dict(
+        func=variable_columns_sound_loader,
+        kwargs=["float_dtype", "allow_multi_rates"],
+        help="Loading variable numbers (columns) of audios in wav.scp. "
+        "The following text file can be loaded as stacked audio data"
+        "\n\n"
+        "   utterance_id_a a1.wav a2.wav a3.wav\n"
+        "   utterance_id_b b1.wav\n"
+        "   utterance_id_c c1.wav c2.wav\n"
+        "   ...\n\n"
+        "Note that audios of different lengths will be right-padded with np.nan "
+        "to the longest audio in the sample.\n"
+        "A preprocessor must be used to remove these paddings.",
+    ),
+    "score": dict(
+        func=score_loader,
+        kwargs=[],
+        help="Return text as is. The text contains tempo and note info.\n"
+        "For each note, 'start' 'end' 'syllabel' 'midi' and 'phones' are included. "
+        "\n\n"
+        "   utterance_id_A tempo_a start_1 end_1 syllable_1 midi_1 phones_1 ...\n"
+        "   utterance_id_B tempo_b start_1 end_1 syllable_1 midi_1 phones_1 ...\n"
+        "   ...",
+    ),
+    "duration": dict(
+        func=label_loader,
+        kwargs=[],
+        help="Return text as is. The text must be converted to ndarray "
+        "by 'preprocess'."
+        "\n\n"
+        "   utterance_id_A start_1 end_1 phone_1 start_2 end_2 phone_2 ...\n"
+        "   utterance_id_B start_1 end_1 phone_1 start_2 end_2 phone_2 ...\n"
+        "   ...",
+    ),
     "kaldi_ark": dict(
         func=kaldi_loader,
-        kwargs=["max_cache_fd"],
+        kwargs=["max_cache_fd", "allow_multi_rates"],
         help="Kaldi-ark file type."
         "\n\n"
         "   utterance_id_A /some/where/a.ark:123\n"
         "   utterance_id_B /some/where/a.ark:456\n"
+        "   ...",
+    ),
+    # before "omniio": types are matched by prefix, first match wins
+    "omniio_segments": dict(
+        func=omniio_segments_loader,
+        kwargs=["float_dtype", "max_cache_fd", "allow_multi_rates"],
+        help="Kaldi segments of recordings stored in Omni-IO archives; the "
+        "recordings' wav.scp must be next to the segments file. Only each "
+        "segment's part of the archive is read and decoded."
+        "\n\n"
+        "   segment_id_a recording_id_x 0.0 10.0\n"
+        "   segment_id_b recording_id_x 10.0 20.0\n"
+        "   ...",
+    ),
+    "omniio": dict(
+        func=omniio_loader,
+        kwargs=["float_dtype", "max_cache_fd", "allow_multi_rates"],
+        help="Audio packed into Omni-IO archives (blob_<i>.bin + metadata.parquet), "
+        "addressed by byte range."
+        "\n\n"
+        "   utterance_id_A /some/where/blob_0.bin:0:31052\n"
+        "   utterance_id_B /some/where/blob_0.bin:31052:92707\n"
         "   ...",
     ),
     "npy": dict(
@@ -203,13 +434,23 @@ DATA_TYPES = {
         "   ...",
     ),
     "text": dict(
-        func=read_2column_text,
-        kwargs=[],
+        func=read_2columns_text,
+        kwargs=["keys_to_load"],
         help="Return text as is. The text must be converted to ndarray "
         "by 'preprocess'."
         "\n\n"
         "   utterance_id_A hello world\n"
         "   utterance_id_B foo bar\n"
+        "   ...",
+    ),
+    "random_text": dict(
+        func=RandomTextReader,
+        kwargs=[],
+        help="Return text as is. The text must be converted to ndarray "
+        "by 'preprocess'."
+        "\n\n"
+        "   hello world\n"
+        "   foo bar\n"
         "   ...",
     ),
     "hdf5": dict(
@@ -242,6 +483,16 @@ DATA_TYPES = {
         "   utterance_id_B 10,4\n"
         "   ...",
     ),
+    "vad_intervals": dict(
+        func=VadIntervalsReader,
+        kwargs=[],
+        help="Speech intervals of a window (samples, end exclusive), read as a "
+        "(length, 1) speech label"
+        "\n\n"
+        "   window_a 160000 0 4000 9000 160000\n"
+        "   window_b 160000\n"
+        "   ...",
+    ),
     "rttm": dict(
         func=RttmReader,
         kwargs=[],
@@ -253,7 +504,19 @@ DATA_TYPES = {
         "    END     file1 <NA> 4023 <NA> <NA> <NA> <NA>"
         "   ...",
     ),
+    "json": dict(
+        func=JsonScpReader,
+        kwargs=[],
+        help="Utterance-keyed JSON objects for structured annotations"
+        "\n\n"
+        '   utterance_id_A {"metric": 0.0}\n'
+        '   utterance_id_B {"metric": 0.1}\n'
+        "   ...",
+    ),
 }
+
+# Historical recipes use the metric data-type name.
+DATA_TYPES["metric"] = DATA_TYPES["json"]
 
 
 class AbsDataset(Dataset, ABC):
@@ -270,6 +533,28 @@ class AbsDataset(Dataset, ABC):
         raise NotImplementedError
 
 
+def _read_span(loader, uid: str, start: int, end: int, context: int = 0):
+    """Samples start - context .. end - 1 of `uid` from `loader`.
+
+    See ESPnetDataset; samples before the start of the sequence are zeros.
+    """
+    first = max(start - context, 0)
+    if hasattr(loader, "read_span"):
+        value = loader.read_span(uid, first, end)
+    else:
+        value = loader[uid]
+        if not (
+            isinstance(value, np.ndarray) and value.ndim >= 1 and len(value) >= end
+        ):
+            return value
+        value = value[first:end]
+    missing = context - start
+    if missing > 0:
+        pad = np.zeros((missing,) + value.shape[1:], dtype=value.dtype)
+        value = np.concatenate([pad, value], 0)
+    return value
+
+
 class ESPnetDataset(AbsDataset):
     """Pytorch Dataset class for ESPNet.
 
@@ -281,18 +566,20 @@ class ESPnetDataset(AbsDataset):
         {'input': per_utt_array, 'output': per_utt_array}
     """
 
+    @typechecked
     def __init__(
         self,
         path_name_type_list: Collection[Tuple[str, str, str]],
-        preprocess: Callable[
-            [str, Dict[str, np.ndarray]], Dict[str, np.ndarray]
+        preprocess: Optional[
+            Callable[[str, Dict[str, np.ndarray]], Dict[str, np.ndarray]]
         ] = None,
         float_dtype: str = "float32",
         int_dtype: str = "long",
         max_cache_size: Union[float, int, str] = 0.0,
         max_cache_fd: int = 0,
+        allow_multi_rates: bool = False,
+        keys_to_load: Optional[Set[Union[str, int]]] = None,
     ):
-        assert check_argument_types()
         if len(path_name_type_list) == 0:
             raise ValueError(
                 '1 or more elements are required for "path_name_type_list"'
@@ -304,6 +591,8 @@ class ESPnetDataset(AbsDataset):
         self.float_dtype = float_dtype
         self.int_dtype = int_dtype
         self.max_cache_fd = max_cache_fd
+        # allow audios to have different sampling rates
+        self.allow_multi_rates = allow_multi_rates
 
         self.loader_dict = {}
         self.debug_info = {}
@@ -311,7 +600,7 @@ class ESPnetDataset(AbsDataset):
             if name in self.loader_dict:
                 raise RuntimeError(f'"{name}" is duplicated for data-key')
 
-            loader = self._build_loader(path, _type)
+            loader = self._build_loader(path, _type, keys_to_load)
             self.loader_dict[name] = loader
             self.debug_info[name] = path, _type
             if len(self.loader_dict[name]) == 0:
@@ -328,13 +617,17 @@ class ESPnetDataset(AbsDataset):
             self.cache = None
 
     def _build_loader(
-        self, path: str, loader_type: str
+        self,
+        path: str,
+        loader_type: str,
+        keys_to_load: Optional[Set[Union[str, int]]],
     ) -> Mapping[str, Union[np.ndarray, torch.Tensor, str, numbers.Number]]:
         """Helper function to instantiate Loader.
 
         Args:
             path:  The file path
             loader_type:  loader_type. sound, npy, text_int, text_float, etc
+            keys_to_load:  The set of keys to load. If None, load all.
         """
         for key, dic in DATA_TYPES.items():
             # e.g. loader_type="sound"
@@ -350,6 +643,10 @@ class ESPnetDataset(AbsDataset):
                         kwargs["int_dtype"] = self.int_dtype
                     elif key2 == "max_cache_fd":
                         kwargs["max_cache_fd"] = self.max_cache_fd
+                    elif key2 == "allow_multi_rates":
+                        kwargs["allow_multi_rates"] = self.allow_multi_rates
+                    elif key2 == "keys_to_load":
+                        kwargs["keys_to_load"] = keys_to_load
                     else:
                         raise RuntimeError(f"Not implemented keyword argument: {key2}")
 
@@ -361,7 +658,7 @@ class ESPnetDataset(AbsDataset):
                         name = func.__name__
                     else:
                         name = str(func)
-                    logging.error(f"An error happend with {name}({path})")
+                    logging.error(f"An error happened with {name}({path})")
                     raise
         else:
             raise RuntimeError(f"Not supported: loader_type={loader_type}")
@@ -383,15 +680,33 @@ class ESPnetDataset(AbsDataset):
         _mes += f"\n  preprocess: {self.preprocess})"
         return _mes
 
-    def __getitem__(self, uid: Union[str, int]) -> Tuple[str, Dict[str, np.ndarray]]:
-        assert check_argument_types()
+    @typechecked
+    def __getitem__(
+        self, uid: Union[str, int, Tuple[str, int, int]]
+    ) -> Tuple[str, Dict[str, Union[str, np.ndarray, Dict[str, Any]]]]:
+        """Return (id, data) of `uid`.
+
+        `uid` may be (uid, start, end): samples start..end - 1 of `uid`, as
+        the chunk iterator with --chunk_random_access asks for them. Loaders
+        with ``read_span`` read only that part; other data with at least `end`
+        entries along the first axis are sliced, and shorter data (e.g. a
+        token sequence) are kept whole. The id is then "<uid>-<start>"
+        (start zero-padded to 10 digits). With span_left_context C (set by
+        the chunk iterator from --chunk_left_context), the data named in
+        span_left_context_keys get start - C .. end - 1 instead, zeros before
+        the start of the sequence; the other data keep start .. end - 1.
+        """
+        span = None
+        if isinstance(uid, tuple):
+            uid, start, end = uid
+            span = (start, end)
 
         # Change integer-id to string-id
         if isinstance(uid, int):
             d = next(iter(self.loader_dict.values()))
             uid = list(d)[uid]
 
-        if self.cache is not None and uid in self.cache:
+        if span is None and self.cache is not None and uid in self.cache:
             data = self.cache[uid]
             return uid, data
 
@@ -399,14 +714,36 @@ class ESPnetDataset(AbsDataset):
         # 1. Load data from each loaders
         for name, loader in self.loader_dict.items():
             try:
-                value = loader[uid]
-                if isinstance(value, (list, tuple)):
+                if span is None:
+                    value = loader[uid]
+                elif name in getattr(self, "span_left_context_keys", ()):
+                    value = _read_span(loader, uid, *span, self.span_left_context)
+                else:
+                    value = _read_span(loader, uid, *span)
+                if isinstance(value, (list)):
                     value = np.array(value)
+                if value is None:
+                    if self.preprocess is None:
+                        raise ValueError("Missing audio requires a preprocessor")
                 if not isinstance(
-                    value, (np.ndarray, torch.Tensor, str, numbers.Number)
+                    value,
+                    (
+                        np.ndarray,
+                        torch.Tensor,
+                        str,
+                        numbers.Number,
+                        tuple,
+                        dict,
+                        type(None),
+                    ),
                 ):
                     raise TypeError(
-                        f"Must be ndarray, torch.Tensor, str or Number: {type(value)}"
+                        (
+                            "Must be ndarray, torch.Tensor, "
+                            "str,  Number, tuple, Nonetype, or dict: {}".format(
+                                type(value)
+                            )
+                        )
                     )
             except Exception:
                 path, _type = self.debug_info[name]
@@ -423,21 +760,37 @@ class ESPnetDataset(AbsDataset):
             data[name] = value
 
         # 2. [Option] Apply preprocessing
+        if getattr(self, "install_speaker_prompt", None) is not None:
+            self.install_speaker_prompt(uid, data)
         #   e.g. espnet2.train.preprocessor:CommonPreprocessor
         if self.preprocess is not None:
-            data = self.preprocess(uid, data)
+            key_prefix = self.task + " " if hasattr(self, "task") else ""
+            data = self.preprocess(key_prefix + uid, data)
 
         # 3. Force data-precision
         for name in data:
             value = data[name]
-            if not isinstance(value, np.ndarray):
+            if value is None:
+                raise RuntimeError(f'Missing value for "{name}" after preprocessing.')
+            if not isinstance(value, np.ndarray) and not isinstance(value, dict):
                 raise RuntimeError(
-                    f"All values must be converted to np.ndarray object "
-                    f'by preprocessing, but "{name}" is still {type(value)}.'
+                    f"All values must be converted to np.ndarray or "
+                    "dict object by preprocessing, "
+                    f'but "{name}" is still {type(value)}.'
                 )
 
             # Cast to desired type
-            if value.dtype.kind == "f":
+            if type(value) is dict:
+                # Structured annotation values may contain preprocessed arrays.
+                for k, v in value.items():
+                    if isinstance(v, np.ndarray):
+                        if v.dtype.kind == "f":
+                            value[k] = v.astype(self.float_dtype)
+                        elif v.dtype.kind == "i":
+                            value[k] = v.astype(self.int_dtype)
+                        else:
+                            raise NotImplementedError(f"Not supported dtype: {v.dtype}")
+            elif value.dtype.kind == "f":
                 value = value.astype(self.float_dtype)
             elif value.dtype.kind == "i":
                 value = value.astype(self.int_dtype)
@@ -445,9 +798,163 @@ class ESPnetDataset(AbsDataset):
                 raise NotImplementedError(f"Not supported dtype: {value.dtype}")
             data[name] = value
 
+        if span is not None:
+            return f"{uid}-{span[0]:010d}", data
         if self.cache is not None and self.cache.size < self.max_cache_size:
             self.cache[uid] = data
 
         retval = uid, data
-        assert check_return_type(retval)
         return retval
+
+
+class ESPnetSpeechLMDataset(ESPnetDataset):
+    """ESPnet Speech LM Dataset.
+
+    Dataset object that is specifically designed for SpeechLM. It will allows
+    dataset-level operations (e.g., on-the-fly speaker prompt sampling). It is
+    task-specific and can be queried by ESPnetMultiTaskDataset.
+    """
+
+    def __init__(
+        self,
+        example_list: List,
+        task: str,
+        **kwargs,
+    ):
+        super(ESPnetSpeechLMDataset, self).__init__(**kwargs)
+
+        # (1) build spk2utt map
+        if "utt2spk" in self.loader_dict:
+            self.spk2utt = {}
+            for k, v in self.loader_dict["utt2spk"].items():
+                if v not in self.spk2utt:
+                    self.spk2utt[v] = []
+                self.spk2utt[v].append(k)
+
+        # (2) keep example_list and clean some non-iterable loaders
+        example_dict = {k: None for k in example_list}  # hash for faster query
+        for key in self.loader_dict.keys():
+            loader = self.loader_dict[key]
+            if isinstance(loader, Dict):
+                loader = {k: v for k, v in loader.items() if k in example_dict}
+                self.loader_dict[key] = loader
+
+        # (3) keep task
+        self.task = task
+
+    def install_speaker_prompt(self, uid: str, data: Dict):
+        """Assume the names are utt2spk and wav.scp. Hard code here."""
+        if "utt2spk" in self.loader_dict:
+            spk = self.loader_dict["utt2spk"][uid]
+            utts = self.spk2utt[spk]
+
+            if len(utts) == 1:  # at least itself
+                utt = utts[0]
+            else:
+                while True:
+                    utt = random.sample(utts, 1)[0]
+                    if uid != utt:
+                        break
+
+            if "wav.scp" not in self.loader_dict:
+                raise ValueError("speaker prompt is sampled from wav.scp loader")
+
+            data["utt2spk"] = self.loader_dict["wav.scp"][utt]
+
+
+class ESPnetMultiTaskDataset(AbsDataset):
+    """ESPnet Multi Task Dataset.
+
+    The top-level Dataset object that can manage multiple ESPnetSpeechLMDataset
+    objects, each of which serves a specific task and dataset.
+    This object will query all these ESPnetSpeechLMDataset and combine examples
+    from different tasks for multi-task training. Typically, this dataset is
+    used in ESPnet SpeechLM models
+    See details in:
+    <espnet>/egs2/TEMPLATE/speechlm1#data-loading-and-preprocessing
+    """
+
+    def __init__(
+        self,
+        path_name_type_list: Collection[Tuple[str, str, str]],
+        key_file: str = None,
+        **kwargs,
+    ):
+        if key_file is not None:
+            self.key_dict = {line.strip().split()[0]: None for line in open(key_file)}
+        else:
+            self.key_dict = None
+
+        self.iterator_map = {}
+        self.datasets = []
+        for triplet in path_name_type_list:
+            path, _, _type = triplet
+            assert _type == "dataset_json", f"Non-Json triplet: {triplet}"
+            json_dict = json.load(open(path))
+
+            this_path_name_type_list = []
+            for triplet in json_dict["data_files"]:
+                path, _, _type = triplet.strip().split(",")
+                # use the stem file name as the name
+                this_path_name_type_list.append(
+                    (
+                        path,
+                        path.split("/")[-1],
+                        _type,
+                    )
+                )
+
+            # example_list is for sub_dataest -> no task prefix
+            example_list = [line.strip().split()[0] for line in open(path)]
+            if self.key_dict is not None:
+                example_list = [
+                    e
+                    for e in example_list
+                    if json_dict["task"] + "_" + e in self.key_dict
+                ]
+
+            dataset = ESPnetSpeechLMDataset(
+                path_name_type_list=this_path_name_type_list,
+                example_list=example_list,
+                task=json_dict["task"],
+                **kwargs,
+            )
+            self.datasets.append(dataset)
+
+            # iterator_map is for merged dataset -> with task prefix
+            self.iterator_map.update(
+                {json_dict["task"] + "_" + e: dataset for e in example_list}
+            )
+
+        self.encoder_decoder_format = getattr(
+            kwargs["preprocess"], "encoder_decoder_format", False
+        )
+        self.apply_utt2category = False
+        self.example_list = list(self.iterator_map.keys())
+
+    def __getitem__(self, uid: Union[str, int]) -> Tuple[str, Dict[str, np.ndarray]]:
+        iterator = self.iterator_map[uid]
+        uid_without_prefix = uid.lstrip(iterator.task + "_")
+        uid, data = iterator[uid_without_prefix]
+        uid = iterator.task + "_" + uid
+        return uid, data
+
+    # Keep same interface with IterableDataset
+    def has_name(self, name) -> bool:
+        return name in self.names()
+
+    def names(self) -> Tuple[str, ...]:
+        if self.encoder_decoder_format:
+            return ("enc_seq", "dec_seq", "prefix_len")
+        else:
+            return ("dec_seq", "prefix_len")
+
+    def __repr__(self):
+        string = "##### Multi-Task Dataset #####\n"
+        for idx, dataset in enumerate(self.datasets):
+            string += f"## Sub-Dataset: {idx}; Task: {dataset.task} ##\n"
+            string += f"{dataset}\n"
+        return string
+
+    def __len__(self):
+        return sum([len(d.example_list) for d in self.datasets])

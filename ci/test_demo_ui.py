@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
+
+from playwright.sync_api import sync_playwright
+from test_integration_espnet3_publication_check import _download_sample_audio
+
+SYSTEM_CONFIGS = {
+    "default_asr": {
+        "demo_dir": "exp/demo_ui_default",
+        "expected_texts": ["Input Audio", "Transcription"],
+        "expected_image_inputs": 0,
+        "run_label": "Run",
+    },
+    "custom_asr_image": {
+        "demo_dir": "exp/demo_ui_custom",
+        "expected_texts": ["Input Audio", "Transcription", "Reference Image"],
+        "expected_image_inputs": 1,
+        "run_label": "Run",
+    },
+}
+
+
+def _recipe_root() -> Path:
+    """The recipe the packed demos were built in: the current directory."""
+    return Path.cwd()
+
+
+def _wait_for_url(proc: subprocess.Popen, port: int, timeout: float = 60.0) -> str:
+    url = f"http://127.0.0.1:{port}"
+    output_lines: list[str] = []
+    deadline = time.time() + timeout
+    stdout = proc.stdout
+    if stdout is None:
+        raise RuntimeError("demo app stdout is not captured.")
+    while time.time() < deadline:
+        ready, _, _ = select.select([stdout], [], [], 0.2)
+        if ready:
+            line = stdout.readline()
+            if not line:
+                break
+            output_lines.append(line.rstrip())
+        try:
+            with urlopen(url, timeout=1.0) as response:
+                if response.status == 200:
+                    return url
+        except URLError:
+            pass
+        if proc.poll() is not None:
+            break
+    output_tail = "\n".join(output_lines[-20:])
+    raise RuntimeError(
+        "demo app failed to start.\n"
+        f"demo_dir={proc.args}\n"
+        f"captured_output:\n{output_tail}"
+    )
+
+
+def _start_demo_app(demo_dir: Path, *, port: int) -> tuple[subprocess.Popen, str]:
+    env = os.environ.copy()
+    env["GRADIO_ANALYTICS_ENABLED"] = "0"
+    env["GRADIO_SERVER_NAME"] = "127.0.0.1"
+    env["GRADIO_SERVER_PORT"] = str(port)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONUNBUFFERED"] = "1"
+    proc = subprocess.Popen(
+        [sys.executable, "app.py"],
+        cwd=str(demo_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        bufsize=1,
+    )
+    url = _wait_for_url(proc, port)
+    return proc, url
+
+
+def _stop_demo_app(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def _write_test_image(path: Path) -> None:
+    import numpy as np
+    from PIL import Image
+
+    rng = np.random.default_rng(0)
+    pixels = rng.integers(0, 256, (128, 128, 3), dtype=np.uint8)
+    Image.fromarray(pixels, mode="RGB").save(str(path), format="PNG")
+
+
+def check_demo_ui_labels(system_name: str, config: dict, audio_path: Path) -> str:
+    demo_dir = _recipe_root() / config["demo_dir"]
+    expected_texts = list(config.get("expected_texts", []))
+    expected_image_inputs = int(config.get("expected_image_inputs", 0))
+
+    port = 7860 + list(sorted(SYSTEM_CONFIGS)).index(system_name)
+    proc, url = _start_demo_app(demo_dir, port=port)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            try:
+                page = browser.new_page()
+                page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
+                ui_texts = page.evaluate("""() => {
+                        const values = new Set();
+                        const push = (value) => {
+                            if (typeof value !== "string") {
+                                return;
+                            }
+                            const normalized = value.trim();
+                            if (normalized) {
+                                values.add(normalized);
+                            }
+                        };
+                        for (const element of document.querySelectorAll("*")) {
+                            push(element.textContent);
+                            push(element.getAttribute("aria-label"));
+                            push(element.getAttribute("alt"));
+                            push(element.getAttribute("title"));
+                        }
+                        return Array.from(values);
+                    }""")
+                missing = [
+                    text
+                    for text in expected_texts
+                    if not any(text in candidate for candidate in ui_texts)
+                ]
+                assert not missing, f"{system_name} missing UI text: {missing}"
+                image_inputs = page.locator(
+                    "input[type='file'][accept*='image']"
+                ).count()
+                assert image_inputs == expected_image_inputs, (
+                    f"{system_name} expected {expected_image_inputs} image input(s), "
+                    f"but found {image_inputs}"
+                )
+                run_label = config.get("run_label", "Run")
+                run_button = page.get_by_role(
+                    "button", name=re.compile(run_label, re.I)
+                )
+                run_button.wait_for()
+
+                # A missing required audio input must fail through the actual
+                # Gradio request, then the same app must accept valid audio.
+                run_button.click()
+                page.get_by_text("Error", exact=True).last.wait_for(timeout=30000)
+                output_box = page.get_by_role(
+                    "textbox", name=re.compile("transcription", re.I)
+                )
+                assert not output_box.input_value()
+
+                with tempfile.TemporaryDirectory() as temp_dir_name:
+                    temp_dir = Path(temp_dir_name)
+                    page.locator("input[type='file'][accept*='audio']").set_input_files(
+                        str(audio_path)
+                    )
+                    if expected_image_inputs:
+                        image_path = temp_dir / "sample.png"
+                        _write_test_image(image_path)
+                        page.locator(
+                            "input[type='file'][accept*='image']"
+                        ).set_input_files(str(image_path))
+                    run_button.click()
+
+                output_box = page.get_by_role(
+                    "textbox", name=re.compile("transcription", re.I)
+                )
+                output_box.wait_for()
+                page.wait_for_function(
+                    "el => Boolean((el.value ?? el.textContent ?? '').trim())",
+                    arg=output_box.element_handle(),
+                    timeout=120000,
+                )
+                output_value = output_box.evaluate(
+                    "el => (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')"
+                    " ? el.value : (el.textContent || '')"
+                )
+                return output_value
+            finally:
+                browser.close()
+    finally:
+        _stop_demo_app(proc)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reference-file", type=Path, default=None)
+    args = parser.parse_args()
+    reference = (
+        json.loads(args.reference_file.read_text(encoding="utf-8"))
+        if args.reference_file is not None
+        else None
+    )
+    with tempfile.TemporaryDirectory() as temp_dir_name:
+        audio_path = (
+            Path(reference["audio_path"])
+            if reference is not None
+            else _download_sample_audio(Path(temp_dir_name))
+        )
+        outputs = {
+            system_name: check_demo_ui_labels(system_name, config, audio_path)
+            for system_name, config in sorted(SYSTEM_CONFIGS.items())
+        }
+    assert outputs["default_asr"] == outputs["custom_asr_image"], outputs
+    if reference is not None:
+        for name, text in outputs.items():
+            assert text == reference["text"], (name, text, reference["text"])
+
+
+if __name__ == "__main__":
+    main()

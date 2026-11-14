@@ -1,13 +1,47 @@
-from typing import Any
+import logging
+from typing import Any, Dict, Union
 
 import torch
 import torch.nn
 import torch.optim
 
+from espnet2.torch_utils.safe_torch_load import safe_torch_load
+
+
+def filter_state_dict(
+    dst_state: Dict[str, Union[float, torch.Tensor]],
+    src_state: Dict[str, Union[float, torch.Tensor]],
+):
+    """Filter name, size mismatch instances between dicts.
+
+    Args:
+        dst_state: reference state dict for filtering
+        src_state: target state dict for filtering
+
+    """
+    match_state = {}
+    for key, value in src_state.items():
+        if key in dst_state and (dst_state[key].size() == src_state[key].size()):
+            match_state[key] = value
+        else:
+            if key not in dst_state:
+                logging.warning(
+                    f"Filter out {key} from pretrained dict"
+                    + " because of name not found in target dict"
+                )
+            else:
+                logging.warning(
+                    f"Filter out {key} from pretrained dict"
+                    + " because of size mismatch"
+                    + f"({dst_state[key].size()}-{src_state[key].size()})"
+                )
+    return match_state
+
 
 def load_pretrained_model(
     init_param: str,
     model: torch.nn.Module,
+    ignore_init_mismatch: bool,
     map_location: str = "cpu",
 ):
     """Load a model state and set it to the model.
@@ -64,7 +98,10 @@ def load_pretrained_model(
 
         obj = get_attr(model, dst_key)
 
-    src_state = torch.load(path, map_location=map_location)
+    src_state = safe_torch_load(path, map_location=map_location)
+    if "module" in src_state:
+        src_state = src_state["module"]
+
     if excludes is not None:
         for e in excludes.split(","):
             src_state = {k: v for k, v in src_state.items() if not k.startswith(e)}
@@ -76,6 +113,14 @@ def load_pretrained_model(
             if k.startswith(src_key)
         }
 
+    # Modules that convert older state dicts (upgrade_state_dict) do so before
+    # the keys and shapes are compared.
+    for name, module in obj.named_modules():
+        if callable(getattr(module, "upgrade_state_dict", None)):
+            module.upgrade_state_dict(src_state, f"{name}." if name else "")
+
     dst_state = obj.state_dict()
+    if ignore_init_mismatch:
+        src_state = filter_state_dict(dst_state, src_state)
     dst_state.update(src_state)
     obj.load_state_dict(dst_state)
